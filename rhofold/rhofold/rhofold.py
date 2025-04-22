@@ -52,6 +52,7 @@ class RhoFold(nn.Module):
         self.plddt_head = pLDDTHead(
             **config.model.heads.plddt,
         )
+        self.evo2_head = nn.Linear(8192, config.model.e2eformer_stack.c_s)
 
 
     def forward_cords(self, tokens, single_fea, pair_fea, seq):
@@ -69,7 +70,7 @@ class RhoFold(nn.Module):
 
         return output
 
-    def forward_one_cycle(self, tokens, rna_fm_tokens, recycling_inputs, seq):
+    def forward_one_cycle(self, tokens, rna_fm_tokens, recycling_inputs, seq, evo2_fea=None):
         '''
         Args:
             tokens: [bs, seq_len, c_z]
@@ -98,6 +99,9 @@ class RhoFold(nn.Module):
             pair_mask=torch.ones(pair_fea.shape[:3]).to(device),
             chunk_size=None,
         )
+
+        if exists(evo2_fea):
+            single_fea += self.evo2_head(evo2_fea)
 
         output = self.forward_cords(tokens, single_fea, pair_fea, seq)
 
