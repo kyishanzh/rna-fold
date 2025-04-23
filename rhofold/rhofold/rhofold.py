@@ -52,7 +52,10 @@ class RhoFold(nn.Module):
         self.plddt_head = pLDDTHead(
             **config.model.heads.plddt,
         )
-        self.evo2_head = nn.Linear(8192, config.model.e2eformer_stack.c_s)
+        self.evo2_head = nn.Linear(
+            config.globals.evo2_dim,
+            config.model.e2eformer_stack.c_s
+        )
 
 
     def forward_cords(self, tokens, single_fea, pair_fea, seq):

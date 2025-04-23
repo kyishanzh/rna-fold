@@ -20,6 +20,7 @@ rhofold_config = mlc.ConfigDict(
             "c_t": 64,
             "c_e": 64,
             "c_s": 384,
+            'evo2_dim': 8192,
             'msa_depth': 128,
             'frame_version': 'v5.0',
             "eps": 1e-8,

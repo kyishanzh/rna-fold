@@ -1,2 +1,2 @@
 data
-RhoFold.*/pretrained/
+rhofold/pretrained/**.pt
