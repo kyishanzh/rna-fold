@@ -1,2 +1,4 @@
 data
 rhofold/pretrained/**.pt
+**/__pycache__
+__pycache__
