@@ -136,7 +136,7 @@ class RhoFold(nn.Module):
         outputs = []
         for _r in range(self.config.model.recycling_embedder.recycles):
             output, recycling_inputs = \
-                self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq)
+                self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq, **kwargs)
             outputs.append(output)
 
         return outputs

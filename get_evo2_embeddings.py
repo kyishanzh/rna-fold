@@ -178,7 +178,7 @@ def seq_id_to_embedding(seq_id):
     """
     Get Evo2 embeddings for a given sequence ID from a .pt file
     """
-    embeddings_dir = "data/RNA3D_DATA/evo2_embeddings"
+    embeddings_dir = "/home/user/rna-fold/data/RNA3D_DATA/evo2_embeddings"
     file_path = os.path.join(embeddings_dir, f"{seq_id}.pt")
     
     if os.path.exists(file_path):
@@ -193,8 +193,8 @@ async def process_rna3d_data_async():
     Uses asynchronous processing with rate limiting.
     """
     # Directory containing sequence files
-    seq_dir = "data/RNA3D_DATA/seq"
-    output_dir = "data/RNA3D_DATA/evo2_embeddings"
+    seq_dir = "/home/user/rna-fold/data/RNA3D_DATA/seq"
+    output_dir = "/home/user/rna-fold/data/RNA3D_DATA/evo2_embeddings"
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
