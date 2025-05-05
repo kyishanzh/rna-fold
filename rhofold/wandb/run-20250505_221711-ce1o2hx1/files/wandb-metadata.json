@@ -1,0 +1,43 @@
+{
+  "os": "Linux-6.8.0-57-generic-x86_64-with-debian-trixie-sid",
+  "python": "3.7.12",
+  "startedAt": "2025-05-05T22:17:11.897305Z",
+  "program": "train_rhofold.py",
+  "codePath": "rhofold/train_rhofold.py",
+  "git": {
+    "remote": "https://github.com/kyishanzh/rna-fold",
+    "commit": "8e6cb372585dadb04b4da2f1f6c544f745d101b1"
+  },
+  "email": "alex.zhao.superman@gmail.com",
+  "root": "/home/user/rna-fold/rhofold",
+  "host": "38a7b48a",
+  "username": "user",
+  "executable": "/home/user/.conda/envs/rhofold/bin/python",
+  "codePathLocal": "train_rhofold.py",
+  "cpu_count": 13,
+  "cpu_count_logical": 26,
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "622946848768",
+      "used": "584911822848"
+    }
+  },
+  "memory": {
+    "total": "122382159872"
+  },
+  "cpu": {
+    "count": 13,
+    "countLogical": 26
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA H100 80GB HBM3",
+      "memoryTotal": "85520809984",
+      "cudaCores": 16896,
+      "architecture": "Hopper"
+    }
+  ],
+  "cudaVersion": "12.7"
+}
