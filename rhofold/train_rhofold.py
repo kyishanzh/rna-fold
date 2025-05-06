@@ -61,8 +61,11 @@ class RNADataset(Dataset):
                 if os.path.exists(a3m_path):
                     self.seq_ids.append(seq_id)
         
-        logging.info(f"Found {len(self.seq_ids)} RNA sequences with MSA data for training")
+        # Track filtered out sequences
+        self.filtered_ids = []
         
+        logging.info(f"Found {len(self.seq_ids)} RNA sequences with MSA data for training")
+    
     def __len__(self):
         return len(self.seq_ids)
     
@@ -73,6 +76,16 @@ class RNADataset(Dataset):
         input_fas = os.path.join(self.data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
         input_a3m = os.path.join(self.data_dir, f"RNA3D_DATA/rMSA/{seq_id}.a3m")
         data_dict = get_features(input_fas, input_a3m)
+        
+        # Check if tokens and rna_fm_tokens have the same last dimension
+        if data_dict['tokens'].shape[-1] != data_dict['rna_fm_tokens'].shape[-1]:
+            if seq_id not in self.filtered_ids:
+                logging.warning(f"Skipping {seq_id}: tokens shape {data_dict['tokens'].shape} doesn't match rna_fm_tokens shape {data_dict['rna_fm_tokens'].shape}")
+                self.filtered_ids.append(seq_id)
+            
+            # Get new index by recursively calling __getitem__ with the next index
+            next_idx = (idx + 1) % len(self)
+            return self.__getitem__(next_idx)
         
         # Load evo2 embedding if enabled
         evo2_embedding = None
@@ -218,7 +231,7 @@ def train(args):
     
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+        optimizer, mode='min', factor=0.5, patience=2
     )
     
     # Training loop
@@ -231,7 +244,6 @@ def train(args):
             seq_id = batch['seq_id'][0]
             tokens = batch['tokens'][0].to(device)
             rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
-            assert tokens.shape[-1] == rna_fm_tokens.shape[-1]
             seq = batch['seq'][0]
             pdb_path = batch['pdb_path'][0]
             
@@ -306,6 +318,12 @@ def train(args):
         'loss': avg_epoch_loss,
     }, final_checkpoint_path)
     
+    # Print summary of filtered sequences
+    if hasattr(dataset, 'filtered_ids') and dataset.filtered_ids:
+        logging.info(f"Filtered {len(dataset.filtered_ids)} sequences due to token shape mismatch:")
+        for seq_id in dataset.filtered_ids:
+            logging.info(f"  - {seq_id}")
+    
     if args.use_wandb:
         wandb.finish()
     print(f"Training completed. Final model saved to {final_checkpoint_path}")
@@ -314,7 +332,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train RhoFold with FAPE loss")
     parser.add_argument("--data_dir", type=str, default="/home/user/rna-fold/data", 
                         help="Directory containing RNA data")
-    parser.add_argument("--device", type=str, default="cpu", 
+    parser.add_argument("--device", type=str, default="cuda", 
                         help="Device to run training on (cuda or cpu)")
     parser.add_argument("--checkpoint", type=str, default=None, 
                         help="Path to checkpoint to resume training from")
