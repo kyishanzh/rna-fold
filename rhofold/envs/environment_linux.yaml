@@ -23,6 +23,7 @@ dependencies:
   - ml-collections
   - biopython
   - matplotlib
+  - tqdm
   - typing_extensions
   - ipykernel
   - liblapack=3.9.0=16_linux64_mkl
