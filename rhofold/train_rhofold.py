@@ -31,6 +31,8 @@ NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 CHECKPOINT_EVERY = 2
 WARMUP_STEPS = 100
+SKIP_SHORT_SEQS = True  # If True, skip sequences with length > SEQ_CUTOFF
+SEQ_CUTOFF = 45
 
 # Set to your specific project/entity here or use environment variables
 os.environ["WANDB_API_KEY"] = "71278e965a6e50657c6b254d59ba8fac486c97dd"  # Uncomment and set your API key if needed
@@ -63,6 +65,25 @@ class RNADataset(Dataset):
         
         # Track filtered out sequences
         self.filtered_ids = []
+        self.skipped_long_seqs = []
+        
+        # Skip sequences longer than SEQ_CUTOFF if SKIP_SHORT_SEQS is enabled
+        if SKIP_SHORT_SEQS:
+            filtered_seq_ids = []
+            for seq_id in self.seq_ids:
+                input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
+                # Read sequence to check length
+                with open(input_fas, 'r') as f:
+                    # Skip header line
+                    f.readline()
+                    seq = f.readline().strip()
+                    
+                if len(seq) > SEQ_CUTOFF:
+                    self.skipped_long_seqs.append(seq_id)
+                else:
+                    filtered_seq_ids.append(seq_id)
+            
+            self.seq_ids = filtered_seq_ids
         
         logging.info(f"Found {len(self.seq_ids)} RNA sequences with MSA data for training")
     
@@ -80,7 +101,7 @@ class RNADataset(Dataset):
         # Check if tokens and rna_fm_tokens have the same last dimension
         if data_dict['tokens'].shape[-1] != data_dict['rna_fm_tokens'].shape[-1]:
             if seq_id not in self.filtered_ids:
-                logging.warning(f"Skipping {seq_id}: tokens shape {data_dict['tokens'].shape} doesn't match rna_fm_tokens shape {data_dict['rna_fm_tokens'].shape}")
+                # logging.warning(f"Skipping {seq_id}: tokens shape {data_dict['tokens'].shape} doesn't match rna_fm_tokens shape {data_dict['rna_fm_tokens'].shape}")
                 self.filtered_ids.append(seq_id)
             
             # Get new index by recursively calling __getitem__ with the next index
@@ -200,6 +221,7 @@ def train(args):
                 "epochs": NUM_EPOCHS,
                 "batch_size": BATCH_SIZE,
                 "use_evo2": USE_EVO2,
+                "skip_short_seqs": SKIP_SHORT_SEQS,
             }
         )
         logging.info(f"Initialized wandb with project={WANDB_PROJECT}")
@@ -270,6 +292,11 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
+            # Print sequence length and VRAM usage information
+            print(f"Doing sequence length {len(seq)}")
+            if torch.cuda.is_available():
+                print(f"Took {torch.cuda.memory_allocated() / 1024**2:.2f} MB of VRAM")
+            
             # Track loss
             epoch_loss += loss.item()
             
@@ -322,6 +349,12 @@ def train(args):
     if hasattr(dataset, 'filtered_ids') and dataset.filtered_ids:
         logging.info(f"Filtered {len(dataset.filtered_ids)} sequences due to token shape mismatch:")
         for seq_id in dataset.filtered_ids:
+            logging.info(f"  - {seq_id}")
+    
+    # Print summary of skipped long sequences
+    if hasattr(dataset, 'skipped_long_seqs') and dataset.skipped_long_seqs:
+        logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {SEQ_CUTOFF}:")
+        for seq_id in dataset.skipped_long_seqs:
             logging.info(f"  - {seq_id}")
     
     if args.use_wandb:
