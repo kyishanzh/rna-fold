@@ -1,0 +1,16 @@
+{"time":"2025-05-05T22:15:59.168992442Z","level":"INFO","msg":"using version","core version":"0.18.7"}
+{"time":"2025-05-05T22:15:59.169030051Z","level":"INFO","msg":"created symlink","path":"/home/user/rna-fold/rhofold/wandb/run-20250505_221559-77zcew18/logs/debug-core.log"}
+{"time":"2025-05-05T22:15:59.274632072Z","level":"INFO","msg":"created new stream","id":"77zcew18"}
+{"time":"2025-05-05T22:15:59.274698294Z","level":"INFO","msg":"stream: started","id":"77zcew18"}
+{"time":"2025-05-05T22:15:59.274843335Z","level":"INFO","msg":"writer: Do: started","stream_id":"77zcew18"}
+{"time":"2025-05-05T22:15:59.274843111Z","level":"INFO","msg":"sender: started","stream_id":"77zcew18"}
+{"time":"2025-05-05T22:15:59.274914781Z","level":"INFO","msg":"handler: started","stream_id":"77zcew18"}
+{"time":"2025-05-05T22:15:59.439984123Z","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-05T22:16:01.08279198Z","level":"INFO","msg":"stream: closing","id":"77zcew18"}
+{"time":"2025-05-05T22:16:01.082847755Z","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-05T22:16:01.084108286Z","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-05T22:16:02.380476076Z","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-05T22:16:02.475193238Z","level":"INFO","msg":"handler: closed","stream_id":"77zcew18"}
+{"time":"2025-05-05T22:16:02.475253704Z","level":"INFO","msg":"writer: Close: closed","stream_id":"77zcew18"}
+{"time":"2025-05-05T22:16:02.475301746Z","level":"INFO","msg":"sender: closed","stream_id":"77zcew18"}
+{"time":"2025-05-05T22:16:02.475401232Z","level":"INFO","msg":"stream: closed","id":"77zcew18"}

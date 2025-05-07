@@ -1,0 +1,20 @@
+2025-05-05 22:15:59,552 [INFO] Initialized wandb with project=rhofold
+Number of params: 130059855
+2025-05-05 22:16:00,918 [INFO] Found 8875 RNA sequences with MSA data for training
+Epoch 1/20:   0%|                                                        | 0/8875 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "train_rhofold.py", line 340, in <module>
+    main()
+  File "train_rhofold.py", line 337, in main
+    train(args)
+  File "train_rhofold.py", line 250, in train
+    outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea)
+  File "/home/user/.conda/envs/rhofold/lib/python3.7/site-packages/torch/nn/modules/module.py", line 1102, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/user/rna-fold/rhofold/rhofold/rhofold.py", line 139, in forward
+    self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq, **kwargs)
+  File "/home/user/rna-fold/rhofold/rhofold/rhofold.py", line 89, in forward_one_cycle
+    is_BKL=True)
+  File "/home/user/rna-fold/rhofold/rhofold/model/embedders.py", line 168, in forward
+    assert tokens.ndim == 3
+AssertionError
