@@ -1,4 +1,7 @@
-data
+data/
 rhofold/pretrained/**.pt
 **/__pycache__
 __pycache__
+*.csv
+*.pt
+*.zip
