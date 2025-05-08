@@ -3,13 +3,21 @@ import sys
 import argparse
 import logging
 from tqdm import tqdm
+import time
+import random
+import socket
+import multiprocessing as mp
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.multiprocessing as mp
+from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import wandb
 import numpy as np
 from Bio.PDB import PDBParser
+from torch.cuda.amp import autocast, GradScaler
 
 # Add openfold to path
 openfold_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "openfold"))
@@ -26,13 +34,16 @@ from openfold.utils.loss import compute_fape
 # Training configuration
 CHECKPOINT_DIR = "checkpoints"
 USE_EVO2 = True
-BATCH_SIZE = 1
+BATCH_SIZE = 1  # Keep batch size at 1 for each GPU
 NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 CHECKPOINT_EVERY = 2
 WARMUP_STEPS = 100
 SKIP_SHORT_SEQS = True  # If True, skip sequences with length > SEQ_CUTOFF
-SEQ_CUTOFF = 45
+SEQ_CUTOFF = 73
+GRAD_ACCUM_STEPS = 4   # Number of steps to accumulate gradients
+MAX_SEQ_LENGTH = 45    # Maximum sequence length to process to avoid OOM errors
+USE_FP16 = True        # Enable FP16 (half-precision) training
 
 # Set to your specific project/entity here or use environment variables
 os.environ["WANDB_API_KEY"] = "71278e965a6e50657c6b254d59ba8fac486c97dd"  # Uncomment and set your API key if needed
@@ -42,6 +53,60 @@ os.environ["WANDB_PROJECT"] = "rhofold"  # Uncomment to override default project
 WANDB_API_KEY = os.environ.get("WANDB_API_KEY", None)
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rhofold")
 WANDB_DISABLED = False
+
+def setup_distributed(rank, world_size, port):
+    """
+    Setup distributed training
+    """
+    # Use the provided port (must be the same across all processes)
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = str(port)
+    
+    # Initialize the process group
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    
+    # Set different seeds for different processes for proper randomization
+    torch.manual_seed(42 + rank)
+    np.random.seed(42 + rank)
+    random.seed(42 + rank)
+    
+    # Make sure all processes are synchronized before proceeding
+    torch.cuda.synchronize()
+    dist.barrier()
+
+def cleanup_distributed():
+    """
+    Clean up distributed training
+    """
+    dist.destroy_process_group()
+
+class SequentialDistributedSampler(Sampler):
+    """
+    Distributed Sampler that doesn't shuffle, ensuring each GPU gets
+    unique samples in a deterministic order
+    """
+    def __init__(self, dataset, world_size, rank):
+        self.dataset = dataset
+        self.world_size = world_size
+        self.rank = rank
+        self.num_samples = len(dataset) // world_size + int(len(dataset) % world_size > rank)
+        self.total_size = len(dataset)
+
+    def __iter__(self):
+        # Determine the indices for this process
+        indices = list(range(self.total_size))
+        # Subsample
+        indices = indices[self.rank:self.total_size:self.world_size]
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples
+        
+    def set_epoch(self, epoch):
+        # This method is needed for compatibility with DDP training
+        # Since this sampler is sequential and doesn't shuffle, we don't
+        # need to do anything with the epoch number
+        pass
 
 class RNADataset(Dataset):
     def __init__(self, data_dir, use_evo2=True):
@@ -85,7 +150,7 @@ class RNADataset(Dataset):
             
             self.seq_ids = filtered_seq_ids
         
-        logging.info(f"Found {len(self.seq_ids)} RNA sequences with MSA data for training")
+        logging.info(f"Found {len(self.seq_ids)} RNA sequences length at most {MAX_SEQ_LENGTH} with MSA data for training")
     
     def __len__(self):
         return len(self.seq_ids)
@@ -206,10 +271,19 @@ def compute_fape_loss(output, pdb_path, chain_id=None, length_scale=10.0, l1_cla
     
     return fape
 
-def train(args):
-    # Initialize wandb
-    if args.use_wandb:
-        # Try to login with API key from environment if available
+def train_worker(rank, world_size, args, port):
+    """
+    Training process for a single worker/GPU
+    """
+    # Setup distributed process
+    setup_distributed(rank, world_size, port)
+    
+    # Set this process's device
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    
+    # Initialize wandb only on main process
+    if rank == 0 and args.use_wandb:
         if WANDB_API_KEY:
             wandb.login(key=WANDB_API_KEY)
             logging.info(f"Logged into wandb with API key from environment")
@@ -222,31 +296,79 @@ def train(args):
                 "batch_size": BATCH_SIZE,
                 "use_evo2": USE_EVO2,
                 "skip_short_seqs": SKIP_SHORT_SEQS,
+                "precision": "fp16" if USE_FP16 else "fp32",
+                "grad_accum_steps": GRAD_ACCUM_STEPS,
+                "max_seq_length": MAX_SEQ_LENGTH,
+                "world_size": world_size,
             }
         )
         logging.info(f"Initialized wandb with project={WANDB_PROJECT}")
     
-    # Create checkpoint dir if it doesn't exist
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    # Create checkpoint dir if it doesn't exist (only on main process)
+    if rank == 0:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
-    # Set device
-    device = get_device(args.device)
+    # Wait for rank 0 to create checkpoint dir
+    dist.barrier()
     
     # Initialize model
     model = RhoFold(rhofold_config).to(device)
-    print(f"Number of params: {sum(p.numel() for p in model.parameters())}")
+    
+    # Important: synchronize model parameters across processes
+    # before wrapping with DDP to ensure consistent initialization
+    # Broadcast model parameters from rank 0 to all other ranks
+    for param in model.parameters():
+        dist.broadcast(param.data, src=0)
+    
+    # Wrap model with DDP - Enable find_unused_parameters to handle unused parameters in forward pass
+    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+    
+    if rank == 0:
+        print(f"Number of params: {sum(p.numel() for p in model.parameters())}")
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler(enabled=USE_FP16)
     
     # If starting from a checkpoint, load it
     start_epoch = 0
     if args.checkpoint:
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(checkpoint['model'], strict=False)
+        # Load checkpoint using map_location to place tensors on the right device
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+        checkpoint = torch.load(args.checkpoint, map_location=map_location)
+        
+        # Handle module prefixes in state dict
+        if any(k.startswith('module.') for k in checkpoint['model']):
+            # Model was saved with DDP
+            model.load_state_dict(checkpoint['model'], strict=False)
+        else:
+            # Model was saved without DDP, add module prefix
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            for k, v in checkpoint['model'].items():
+                new_state_dict[f'module.{k}'] = v
+            model.load_state_dict(new_state_dict, strict=False)
+            
         start_epoch = checkpoint.get('epoch', 0)
-        print(f"Loaded checkpoint from {args.checkpoint}, starting from epoch {start_epoch}")
+        if rank == 0:
+            print(f"Loaded checkpoint from {args.checkpoint}, starting from epoch {start_epoch}")
     
-    # Create dataset and dataloader
+    # Synchronize after checkpoint loading
+    dist.barrier()
+    
+    # Create dataset
     dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    
+    # Create distributed sampler to handle sharding
+    sampler = SequentialDistributedSampler(dataset, world_size, rank)
+    
+    # Create dataloader with single batch size (no collation issues)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True
+    )
     
     # Initialize optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -260,13 +382,32 @@ def train(args):
     for epoch in range(start_epoch, NUM_EPOCHS):
         model.train()
         epoch_loss = 0
+        optimizer.zero_grad()
         
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")):
+        # Set epoch for sampler
+        sampler.set_epoch(epoch)
+        
+        # Make sure all processes are synchronized before starting the epoch
+        dist.barrier()
+        
+        # Create progress bar on main process only
+        if rank == 0:
+            pbar = tqdm(total=len(sampler), desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        
+        processed_batches = 0
+        
+        for batch_idx, batch in enumerate(dataloader):
+            # Skip sequences that are too long to avoid OOM
+            seq = batch['seq'][0]
+            if len(seq) > MAX_SEQ_LENGTH:
+                if rank == 0:
+                    print(f"Skipping sequence of length {len(seq)} > {MAX_SEQ_LENGTH}")
+                continue
+                
             # Move data to device
             seq_id = batch['seq_id'][0]
             tokens = batch['tokens'][0].to(device)
             rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
-            seq = batch['seq'][0]
             pdb_path = batch['pdb_path'][0]
             
             # Get chain ID from seq_id if available
@@ -277,93 +418,189 @@ def train(args):
             if USE_EVO2 and batch['evo2_fea'] is not None:
                 evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
             
-            # Forward pass
-            outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea)
+            # Print info only from rank 0 to avoid console spam
+            if rank == 0:
+                print(f"[GPU {rank}] Processing sequence {seq_id} (length {len(seq)})")
             
-            # Take the last output from recycles
-            output = outputs[-1]
+            # Synchronize before each forward pass to ensure all GPUs are ready
+            torch.cuda.synchronize(device)
             
-            # Compute FAPE loss
-            loss = compute_fape_loss(output, pdb_path, chain_id=chain_id)
+            # Forward pass with mixed precision
+            with autocast(enabled=USE_FP16, dtype=torch.float16):
+                # Run model forward pass
+                outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea)
+                
+                # Take the last output from recycles
+                output = outputs[-1]
+                
+                # Make sure to touch all output tensors to ensure proper DDP synchronization
+                # This helps with the unused parameter issue
+                for k, v in output.items():
+                    if isinstance(v, torch.Tensor) and v.requires_grad:
+                        v.sum()  # Just to make sure tensor is used
+                
+                # Compute FAPE loss
+                loss = compute_fape_loss(output, pdb_path, chain_id=chain_id)
+                # Scale the loss for gradient accumulation
+                loss = loss / GRAD_ACCUM_STEPS
             
-            # Backward pass and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            
+            # Step if we've accumulated enough gradients
+            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
+                # Unscale before gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            # Synchronize after backward to ensure all processes have completed their backward pass
+            torch.cuda.synchronize(device)
             
             # Print sequence length and VRAM usage information
-            print(f"Doing sequence length {len(seq)}")
-            if torch.cuda.is_available():
-                print(f"Took {torch.cuda.memory_allocated() / 1024**2:.2f} MB of VRAM")
+            if rank == 0:
+                print(f"[GPU {rank}] Took {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB of VRAM")
+                # Force CUDA to free memory cache if needed
+                if batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
             
             # Track loss
-            epoch_loss += loss.item()
+            epoch_loss += loss.item() * GRAD_ACCUM_STEPS
+            processed_batches += 1
             
-            # Log batch metrics
-            if args.use_wandb:
+            # Log batch metrics on main process
+            if rank == 0 and args.use_wandb:
                 wandb.log({
-                    "batch_loss": loss.item(),
+                    "batch_loss": loss.item() * GRAD_ACCUM_STEPS,
                     "pLDDT": output["plddt"][1].item(),
                     "seq_id": seq_id,
-                    "seq_length": len(seq)
+                    "seq_length": len(seq),
+                    "memory_usage_MB": torch.cuda.memory_allocated(device) / 1024**2,
+                    "gpu": rank
                 })
+            
+            # Update progress bar on main process
+            if rank == 0:
+                pbar.update(1)
+        
+        # Close progress bar on main process
+        if rank == 0:
+            pbar.close()
+        
+        # Wait for all processes to finish their epoch iterations
+        dist.barrier()
         
         # Calculate average epoch loss
-        avg_epoch_loss = epoch_loss / len(dataloader)
+        # Gather losses from all GPUs
+        if processed_batches > 0:
+            avg_loss = epoch_loss / processed_batches
+        else:
+            avg_loss = 0
+            
+        # Average loss across all processes
+        avg_loss_tensor = torch.tensor([avg_loss], device=device)
+        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
+        avg_loss = avg_loss_tensor.item() / world_size
         
-        # Log epoch metrics
-        print(f"Epoch {epoch+1} - Loss: {avg_epoch_loss:.4f}")
-        if args.use_wandb:
-            wandb.log({
-                "epoch": epoch + 1,
-                "train_loss": avg_epoch_loss,
-                "learning_rate": optimizer.param_groups[0]['lr']
-            })
+        # Get total processed batches from all GPUs
+        processed_tensor = torch.tensor([processed_batches], device=device)
+        dist.all_reduce(processed_tensor, op=dist.ReduceOp.SUM)
+        total_processed = processed_tensor.item()
         
-        # Update learning rate scheduler
-        scheduler.step(avg_epoch_loss)
+        # Log epoch metrics on main process
+        if rank == 0:
+            print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f} - Processed {total_processed} sequences")
+            if args.use_wandb:
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "train_loss": avg_loss,
+                    "learning_rate": optimizer.param_groups[0]['lr'],
+                    "processed_sequences": total_processed
+                })
         
-        # Save checkpoint
-        if (epoch + 1) % CHECKPOINT_EVERY == 0:
+        # Update learning rate scheduler (on main process only)
+        if rank == 0:
+            scheduler.step(avg_loss)
+            
+            # Broadcast new learning rate to all processes
+            for i, param_group in enumerate(optimizer.param_groups):
+                lr = torch.tensor([param_group['lr']], device=device)
+                dist.broadcast(lr, src=0)
+                if rank != 0:
+                    param_group['lr'] = lr.item()
+        
+        # Save checkpoint (on main process only)
+        if (epoch + 1) % CHECKPOINT_EVERY == 0 and rank == 0:
             checkpoint_path = os.path.join(CHECKPOINT_DIR, f"rhofold_epoch_{epoch+1}.pt")
             torch.save({
                 'epoch': epoch + 1,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'loss': avg_epoch_loss,
+                'loss': avg_loss,
             }, checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
+        
+        # Make sure all processes sync up before starting next epoch
+        dist.barrier()
     
-    # Save final model
-    final_checkpoint_path = os.path.join(CHECKPOINT_DIR, "rhofold_final.pt")
-    torch.save({
-        'epoch': NUM_EPOCHS,
-        'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'loss': avg_epoch_loss,
-    }, final_checkpoint_path)
+    # Save final model (on main process only)
+    if rank == 0:
+        final_checkpoint_path = os.path.join(CHECKPOINT_DIR, "rhofold_final.pt")
+        torch.save({
+            'epoch': NUM_EPOCHS,
+            'model': model.state_dict(),
+            'loss': avg_loss,
+        }, final_checkpoint_path)
+        
+        # Print summary of filtered sequences
+        if hasattr(dataset, 'filtered_ids') and dataset.filtered_ids:
+            logging.info(f"Filtered {len(dataset.filtered_ids)} sequences due to token shape mismatch:")
+            for seq_id in dataset.filtered_ids:
+                logging.info(f"  - {seq_id}")
+        
+        # Print summary of skipped long sequences
+        if hasattr(dataset, 'skipped_long_seqs') and dataset.skipped_long_seqs:
+            logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {SEQ_CUTOFF}:")
+            for seq_id in dataset.skipped_long_seqs:
+                logging.info(f"  - {seq_id}")
+        
+        if args.use_wandb:
+            wandb.finish()
+        print(f"Training completed. Final model saved to {final_checkpoint_path}")
     
-    # Print summary of filtered sequences
-    if hasattr(dataset, 'filtered_ids') and dataset.filtered_ids:
-        logging.info(f"Filtered {len(dataset.filtered_ids)} sequences due to token shape mismatch:")
-        for seq_id in dataset.filtered_ids:
-            logging.info(f"  - {seq_id}")
+    # Clean up distributed process
+    dist.barrier()  # Final sync point
+    cleanup_distributed()
+
+def train(args):
+    # Get number of available GPUs
+    world_size = torch.cuda.device_count()
     
-    # Print summary of skipped long sequences
-    if hasattr(dataset, 'skipped_long_seqs') and dataset.skipped_long_seqs:
-        logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {SEQ_CUTOFF}:")
-        for seq_id in dataset.skipped_long_seqs:
-            logging.info(f"  - {seq_id}")
+    # Select a random port before spawning processes to ensure all processes use the same port
+    port = 12355 + random.randint(0, 1000)
     
-    if args.use_wandb:
-        wandb.finish()
-    print(f"Training completed. Final model saved to {final_checkpoint_path}")
+    if world_size > 1:
+        logging.info(f"Found {world_size} GPUs, using DistributedDataParallel for training on port {port}")
+        # Launch multiple processes, one per GPU
+        mp.spawn(
+            train_worker,
+            args=(world_size, args, port),
+            nprocs=world_size,
+            join=True
+        )
+    else:
+        logging.info("Found only 1 GPU, using single device training")
+        # Just run on a single GPU (rank 0)
+        train_worker(0, 1, args, port)
 
 def main():
+    # Set environment variable to help debug DDP unused parameters
+    os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+    
     parser = argparse.ArgumentParser(description="Train RhoFold with FAPE loss")
-    parser.add_argument("--data_dir", type=str, default="/home/user/rna-fold/data", 
+    parser.add_argument("--data_dir", type=str, default="/dev/shm", 
                         help="Directory containing RNA data")
     parser.add_argument("--device", type=str, default="cuda", 
                         help="Device to run training on (cuda or cpu)")
@@ -371,18 +608,29 @@ def main():
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--use_wandb", action="store_true", default=WANDB_DISABLED,
                         help="Whether to use Weights & Biases for logging")
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Enable debug mode with more verbose logging")
     args = parser.parse_args()
     
     # Configure logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.StreamHandler(sys.stdout)
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("rhofold_training.log")
         ]
     )
+    
+    # Set deterministic training for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
     
     train(args)
 
 if __name__ == "__main__":
+    # Required for proper multiprocessing on Linux
+    mp.set_start_method('spawn', force=True)
     main() 
