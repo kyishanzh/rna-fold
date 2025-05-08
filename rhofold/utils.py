@@ -119,9 +119,9 @@ def g_features(seq_id):
 
     return {
         "seq": features["seq"],
-        "tokens": features["tokens"].cuda(),
-        "rna_fm_tokens": features["rna_fm_tokens"].cuda(),
-        "evo2_fea": evo2_fea.cuda(),
+        "tokens": torch.tensor(features["tokens"]).cuda(),
+        "rna_fm_tokens": torch.tensor(features["rna_fm_tokens"]).cuda(),
+        "evo2_fea": torch.tensor(evo2_fea).cuda(),
     }
 
 

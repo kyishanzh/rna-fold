@@ -144,7 +144,7 @@ def get_features(fas_fpath, msa_fpath, msa_depth=128):
     if os.path.exists(msa_fpath):
         msa_tokens = get_msa_feature(msa_path=msa_fpath, msa_depth=msa_depth)
     else:
-        msa_tokens = rna_fm_tokens
+        msa_tokens = rna_fm_tokens.unsqueeze(0)
 
     return {
         "seq": seq,

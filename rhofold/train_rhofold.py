@@ -246,7 +246,13 @@ def compute_fape_loss(output, pdb_path, chain_id=None, length_scale=10.0, l1_cla
         chain = structure[0][chain_id]
     
     # Extract C1' atoms from the PDB structure
-    gt_c1_positions = np.array([res["C1'"].get_coord() for res in chain])
+    gt_c1_positions = []
+    for res in chain:
+        try:
+            gt_c1_positions.append(res["C1'"].get_coord())
+        except:
+            gt_c1_positions.append([0, 0, 0])
+    gt_c1_positions = np.array(gt_c1_positions)
     
     # Convert to tensor with same dtype and device as predictions
     dtype = pred_frames_tensor.dtype
@@ -530,14 +536,10 @@ def train_worker(args):
                 output = outputs[-1]
                 
                 # Compute FAPE loss
-                try:
-                    loss = compute_fape_loss(output, pdb_path)
-                    # Scale the loss for gradient accumulation
-                    loss = loss / GRAD_ACCUM_STEPS
-                except Exception as e:
-                    print(f"Error computing FAPE loss: {e}")
-                    loss = 0
-            
+                loss = compute_fape_loss(output, pdb_path)
+                # Scale the loss for gradient accumulation
+                loss = loss / GRAD_ACCUM_STEPS
+
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
             
@@ -549,10 +551,6 @@ def train_worker(args):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-            
-            # Free memory if needed
-            if batch_idx % 10 == 0:
-                torch.cuda.empty_cache()
             
             # Track loss
             epoch_loss += loss.item() * GRAD_ACCUM_STEPS
@@ -573,7 +571,7 @@ def train_worker(args):
                 pbar.update(1)
                 
             # Run evaluation at regular intervals
-            if (batch_idx + 1) % eval_interval == 0:
+            if batch_idx % eval_interval == 0:
                 if rank == 0:
                     print(f"\n[Evaluation] Running at {(batch_idx + 1) / total_batches * 100:.1f}% of epoch {epoch + 1}")
                 
