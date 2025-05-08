@@ -1,4 +1,5 @@
 from typing import Sequence, Union
+import os
 import torch
 import string
 import itertools
@@ -138,10 +139,12 @@ def get_features(fas_fpath, msa_fpath, msa_depth=128):
     """
 
     seq = read_fas(fas_fpath)[0][1]
-
-    msa_tokens = get_msa_feature(msa_path=msa_fpath, msa_depth=msa_depth)
-
     rna_fm_tokens = get_rna_fm_token(fas_fpath)
+
+    if os.path.exists(msa_fpath):
+        msa_tokens = get_msa_feature(msa_path=msa_fpath, msa_depth=msa_depth)
+    else:
+        msa_tokens = rna_fm_tokens
 
     return {
         "seq": seq,

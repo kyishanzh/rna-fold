@@ -45,8 +45,7 @@ NUM_EPOCHS = 20
 LEARNING_RATE = 4e-4
 CHECKPOINT_EVERY = 2
 WARMUP_STEPS = 100
-SKIP_SHORT_SEQS = True  # If True, skip sequences with length > SEQ_CUTOFF
-SEQ_CUTOFF = 73
+SKIP_SHORT_SEQS = True  # If True, skip sequences with length > MAX_SEQ_LENGTH
 GRAD_ACCUM_STEPS = 4   # Number of steps to accumulate gradients
 MAX_SEQ_LENGTH = 45    # Maximum sequence length to process to avoid OOM errors
 USE_FP16 = True        # Enable FP16 (half-precision) training
@@ -142,27 +141,20 @@ class RNADataset(Dataset):
         for f in os.listdir(seq_dir):
             if f.endswith('.seq'):
                 seq_id = f.split('.')[0]
-                a3m_path = os.path.join(rMSA_dir, f"{seq_id}.a3m")
-                
-                # Only include if a3m file exists
-                if os.path.exists(a3m_path):
-                    self.seq_ids.append(seq_id)
+                self.seq_ids.append(seq_id)
         
         # Track filtered out sequences
         self.filtered_ids = []
-        self.skipped_long_seqs = []
         
-        # Skip sequences longer than SEQ_CUTOFF if SKIP_SHORT_SEQS is enabled
+        # Skip sequences longer than MAX_SEQ_LENGTH if SKIP_SHORT_SEQS is enabled
         if SKIP_SHORT_SEQS:
             filtered_seq_ids = []
             for seq_id in self.seq_ids:
                 input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
                 # Read sequence to check length
-                seq = read_fas(input_fas)
+                seq = read_fas(input_fas)[0][1]
                     
-                if len(seq) > SEQ_CUTOFF:
-                    self.skipped_long_seqs.append(seq_id)
-                else:
+                if len(seq) <= MAX_SEQ_LENGTH:
                     filtered_seq_ids.append(seq_id)
             
             self.seq_ids = filtered_seq_ids
@@ -512,24 +504,22 @@ def train_worker(args):
         for batch_idx, batch in enumerate(dataloader):
             # Skip sequences that are too long to avoid OOM
             seq = batch['seq'][0]
-            if len(seq) > MAX_SEQ_LENGTH:
-                if rank == 0:
-                    print(f"Skipping sequence of length {len(seq)} > {MAX_SEQ_LENGTH}")
-                continue
+            assert len(seq) <= MAX_SEQ_LENGTH, f"Sequence length {len(seq)} > {MAX_SEQ_LENGTH}"
                 
             # Process batch data
             seq_id = batch['seq_id'][0]
             tokens = batch['tokens'][0].to(device)
             rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
             pdb_path = batch['pdb_path'][0]
+            while tokens.dim() < 3:
+                tokens = tokens.unsqueeze(0)
+            while rna_fm_tokens.dim() < 2:
+                rna_fm_tokens = rna_fm_tokens.unsqueeze(0)
             
             # Handle evo2 features
             evo2_fea = None
             if USE_EVO2 and batch['evo2_fea'] is not None:
                 evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
-            
-            if rank == 0 and batch_idx % 10 == 0:
-                print(f"[GPU {rank}] Processing sequence {seq_id} (length {len(seq)})")
             
             # Forward pass with mixed precision
             with autocast(enabled=USE_FP16, dtype=torch.float16):
@@ -540,9 +530,13 @@ def train_worker(args):
                 output = outputs[-1]
                 
                 # Compute FAPE loss
-                loss = compute_fape_loss(output, pdb_path)
-                # Scale the loss for gradient accumulation
-                loss = loss / GRAD_ACCUM_STEPS
+                try:
+                    loss = compute_fape_loss(output, pdb_path)
+                    # Scale the loss for gradient accumulation
+                    loss = loss / GRAD_ACCUM_STEPS
+                except Exception as e:
+                    print(f"Error computing FAPE loss: {e}")
+                    loss = 0
             
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
@@ -671,7 +665,7 @@ def train_worker(args):
         
         # Print summary of skipped long sequences
         if hasattr(dataset, 'skipped_long_seqs') and dataset.skipped_long_seqs:
-            logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {SEQ_CUTOFF}")
+            logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {MAX_SEQ_LENGTH}")
         
         if args.use_wandb:
             wandb.finish()

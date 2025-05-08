@@ -13,10 +13,10 @@
 """Structure refinement"""
 import os.path
 
-from simtk.openmm.app import *
-from simtk.openmm import *
+from openmm.app import *
+from openmm import *
 from simtk.unit import *
-import simtk.openmm as mm
+import openmm as mm
 from sys import stdout
 from rhofold.utils import timing, tmpdir
 import subprocess
