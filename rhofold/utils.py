@@ -1,11 +1,11 @@
 import logging
+import pickle
 import os
 import sys
 
 import numpy as np
 import torch
 
-from rhofold.data.balstn import BLASTN
 from rhofold.rhofold import RhoFold
 from rhofold.config import rhofold_config
 from rhofold.utils import get_device, save_ss2ct, timing
@@ -33,7 +33,7 @@ def load_model(ckpt="./pretrained/RhoFold_pretrained.pt"):
     return model.cuda()
 
 
-data_folder = "/srv/mingyang/dev/personal/rna-fold/data/"
+data_folder = "/dev/shm/"
 
 train_csv = data_folder + "train_sequences.csv"
 val_csv = data_folder + "validation_sequences.csv"
@@ -58,16 +58,16 @@ def prepare_ds():
             # print(seq_id)
             seq = row["sequence"]
             # only need to do once.
-            # with open(f"{data_folder}/MSA/{seq_id}.fasta", "w") as f:
-            #     f.write(f">{seq_id}\n{seq}")
+            with open(data_folder + f"MSA/{seq_id}.fasta", "w") as f:
+                f.write(f">{seq_id}\n{seq}")
             id_to_seq[seq_id] = seq
 
     prepare_csv(train_csv)
     prepare_csv(val_csv)
     prepare_csv(test_csv)
 
-    train_labels = "/srv/mingyang/dev/personal/rna-fold/data/train_labels.csv"
-    val_labels = "/srv/mingyang/dev/personal/rna-fold/data/validation_labels.csv"
+    train_labels = data_folder + "train_labels.csv"
+    val_labels = data_folder + "validation_labels.csv"
     id_to_loc = dict()
     for csv in [train_labels, val_labels]:
         df = pd.read_csv(csv)
@@ -106,8 +106,8 @@ def all_seq_ids(split="train"):  # train, val, test; return all the seq ids
 
 
 def g_features(seq_id):
-    fasta_path = f"{data_folder}/MSA/{seq_id}.fasta"  # This should contain just your query sequence
-    msa_path = f"{data_folder}/MSA/{seq_id}.MSA.fasta"  # This is your MSA file
+    fasta_path = f"{data_folder}MSA/{seq_id}.fasta"  # This should contain just your query sequence
+    msa_path = f"{data_folder}MSA/{seq_id}.MSA.fasta"  # This is your MSA file
 
     # Get features (optionally specify msa_depth, default is 128)
     features = get_features(
@@ -115,10 +115,13 @@ def g_features(seq_id):
         msa_fpath=msa_path,
         msa_depth=128,  # You can adjust this if you want to use more/fewer sequences from the MSA
     )
+    evo2_fea = evo2_features[seq_id]
+
     return {
         "seq": features["seq"],
         "tokens": features["tokens"].cuda(),
         "rna_fm_tokens": features["rna_fm_tokens"].cuda(),
+        "evo2_fea": evo2_fea.cuda(),
     }
 
 
@@ -164,6 +167,9 @@ def tm_score(P, Q):
 
 import torch.distributed as dist
 from tqdm import tqdm
+
+with open("/dev/shm/nvidia_evo2_full_embeddings.pkl", "rb") as f:
+    evo2_features = pickle.load(f)
 
 
 def eval_model(generator):

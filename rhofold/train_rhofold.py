@@ -31,12 +31,18 @@ from rhofold.utils.alphabet import get_features
 from openfold.utils.rigid_utils import Rigid, Rotation
 from openfold.utils.loss import compute_fape
 
+# Import evaluation utilities
+from utils import eval_model, tm_score as calculate_tm_score
+
+# Import distributed utilities to ensure compatibility with eval_model
+from distributed_utils import get_world_size, get_rank, is_main_process
+
 # Training configuration
 CHECKPOINT_DIR = "checkpoints"
 USE_EVO2 = True
 BATCH_SIZE = 1  # Keep batch size at 1 for each GPU
 NUM_EPOCHS = 20
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 4e-4
 CHECKPOINT_EVERY = 2
 WARMUP_STEPS = 100
 SKIP_SHORT_SEQS = True  # If True, skip sequences with length > SEQ_CUTOFF
@@ -313,6 +319,7 @@ def train_worker(rank, world_size, args, port):
     
     # Initialize model
     model = RhoFold(rhofold_config).to(device)
+    torch.compile(model)
     
     # Important: synchronize model parameters across processes
     # before wrapping with DDP to ensure consistent initialization
@@ -395,6 +402,8 @@ def train_worker(rank, world_size, args, port):
             pbar = tqdm(total=len(sampler), desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
         
         processed_batches = 0
+        total_batches = len(dataloader)
+        eval_interval = max(1, total_batches // 10)  # Evaluate every 10% of an epoch
         
         for batch_idx, batch in enumerate(dataloader):
             # Skip sequences that are too long to avoid OOM
@@ -484,6 +493,59 @@ def train_worker(rank, world_size, args, port):
             # Update progress bar on main process
             if rank == 0:
                 pbar.update(1)
+                
+            # Run evaluation every 10% of an epoch
+            if batch_idx % eval_interval == 0:
+                if rank == 0:
+                    print(f"\n[Evaluation] Running evaluation at {(batch_idx + 1) / total_batches * 100:.1f}% of epoch {epoch + 1}")
+                
+                # Make sure all processes are synchronized before evaluation
+                dist.barrier()
+                
+                # Switch model to eval mode
+                model.eval()
+                
+                try:
+                    # Define generator function for eval_model
+                    def generator(features):
+                        with torch.no_grad():
+                            with autocast(enabled=USE_FP16, dtype=torch.float16):
+                                # Call the model's forward method directly through module to bypass DDP wrapper
+                                outputs = model.module(
+                                    tokens=features["tokens"], 
+                                    rna_fm_tokens=features["rna_fm_tokens"], 
+                                    seq=features["seq"],
+                                    evo2_fea=features["evo2_fea"]
+                                )
+                                preds = []
+                                for i in range(min(5, len(outputs))):
+                                    preds.append(outputs[i]["cords_c1'"][0][0])
+                                return preds
+                    
+                    # Run evaluation
+                    eval_score = eval_model(generator)
+                    
+                    # Log evaluation metrics on main process
+                    if rank == 0 and args.use_wandb:
+                        wandb.log({
+                            "epoch": epoch + 1,
+                            "progress": (batch_idx + 1) / total_batches,
+                            "tm_score": eval_score
+                        })
+                        print(f"[Evaluation] TM Score: {eval_score:.4f}")
+                except Exception as e:
+                    if rank == 0:
+                        print(f"[Evaluation] Error during evaluation: {str(e)}")
+                        logging.error(f"Evaluation error: {str(e)}")
+                
+                # Make sure all processes are synchronized after evaluation
+                dist.barrier()
+                
+                # Switch back to train mode
+                model.train()
+                
+                # Empty cuda cache after evaluation to free up memory
+                torch.cuda.empty_cache()
         
         # Close progress bar on main process
         if rank == 0:
@@ -606,7 +668,7 @@ def main():
                         help="Device to run training on (cuda or cpu)")
     parser.add_argument("--checkpoint", type=str, default=None, 
                         help="Path to checkpoint to resume training from")
-    parser.add_argument("--use_wandb", action="store_true", default=WANDB_DISABLED,
+    parser.add_argument("--use_wandb", action="store_true", default=not WANDB_DISABLED,
                         help="Whether to use Weights & Biases for logging")
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable debug mode with more verbose logging")
