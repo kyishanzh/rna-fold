@@ -56,21 +56,27 @@ WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rhofold")
 WANDB_DISABLED = False
 
 
-def setup_distributed(rank, world_size, port=12355):
+def setup_distributed():
     """
-    Setup distributed training environment
+    Setup distributed training environment for torchrun
     
-    Args:
-        rank: Process rank
-        world_size: Total number of processes
-        port: Port number for communication
+    Environment variables set by torchrun:
+    - RANK: Global rank of the process
+    - WORLD_SIZE: Total number of processes
+    - LOCAL_RANK: Local rank of the process on the current node
+    - MASTER_ADDR: Address of the master node
+    - MASTER_PORT: Port of the master node
     """
-    # Use the provided port (must be the same across all processes)
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(port)
+    # Get local rank and world size from environment variables (set by torchrun)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
     
-    # Initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Enable NCCL debugging if needed (uncomment for debugging)
+    # os.environ['NCCL_DEBUG'] = 'INFO'
+    
+    # Initialize the process group using env vars set by torchrun
+    dist.init_process_group("nccl")
     
     # Set different seeds for different processes for proper randomization
     torch.manual_seed(42 + rank)
@@ -78,10 +84,12 @@ def setup_distributed(rank, world_size, port=12355):
     random.seed(42 + rank)
     
     # Set device for this process
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(local_rank)
     
     # Make sure all processes are synchronized before proceeding
     dist.barrier()
+    
+    return local_rank, rank, world_size
 
 
 def cleanup_distributed():
@@ -149,6 +157,7 @@ class RNADataset(Dataset):
             filtered_seq_ids = []
             for seq_id in self.seq_ids:
                 input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
+                # Read sequence to check length
                 seq = read_fas(input_fas)
                     
                 if len(seq) > SEQ_CUTOFF:
@@ -385,21 +394,18 @@ def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
         return 0.0
 
 
-def train_worker(rank, world_size, args, port):
+def train_worker(args):
     """
-    Training process for a single worker/GPU
+    Training process for a single worker/GPU using torchrun
     
     Args:
-        rank: Process rank
-        world_size: Total number of processes
         args: Command line arguments
-        port: Port number for communication
     """
-    # Setup distributed process
-    setup_distributed(rank, world_size, port)
+    # Setup distributed process (returns local_rank, global_rank, world_size)
+    local_rank, rank, world_size = setup_distributed()
     
-    # Set this process's device
-    device = torch.device(f"cuda:{rank}")
+    # Set this process's device based on local_rank
+    device = torch.device(f"cuda:{local_rank}")
     
     # Initialize wandb only on main process
     if rank == 0 and args.use_wandb:
@@ -521,6 +527,9 @@ def train_worker(rank, world_size, args, port):
             evo2_fea = None
             if USE_EVO2 and batch['evo2_fea'] is not None:
                 evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
+            
+            if rank == 0 and batch_idx % 10 == 0:
+                print(f"[GPU {rank}] Processing sequence {seq_id} (length {len(seq)})")
             
             # Forward pass with mixed precision
             with autocast(enabled=USE_FP16, dtype=torch.float16):
@@ -675,31 +684,18 @@ def train_worker(rank, world_size, args, port):
 
 def train(args):
     """
-    Main training function that sets up distributed training
+    Main training function that works with torchrun
+    
+    For torchrun, this function directly calls train_worker
+    instead of spawning processes, as torchrun handles process creation
     
     Args:
         args: Command line arguments
     """
-    # Get number of available GPUs
-    world_size = torch.cuda.device_count()
-    
-    # Select a random port for distributed communication
-    port = 12355 + random.randint(0, 1000)
-    
     try:
-        if world_size > 1:
-            logging.info(f"Found {world_size} GPUs, using DistributedDataParallel for training on port {port}")
-            # Launch multiple processes, one per GPU
-            mp.spawn(
-                train_worker,
-                args=(world_size, args, port),
-                nprocs=world_size,
-                join=True
-            )
-        else:
-            logging.info("Found only 1 GPU, using single device training")
-            # Just run on a single GPU (rank 0)
-            train_worker(0, 1, args, port)
+        # When using torchrun, we directly call train_worker 
+        # as the processes are already spawned
+        train_worker(args)
     except Exception as e:
         logging.error(f"Training failed with error: {str(e)}")
         # Make sure to clean up in case of error
@@ -743,8 +739,6 @@ def main():
     parser = argparse.ArgumentParser(description="Train RhoFold with FAPE loss")
     parser.add_argument("--data_dir", type=str, default="/dev/shm", 
                         help="Directory containing RNA data")
-    parser.add_argument("--device", type=str, default="cuda", 
-                        help="Device to run training on (cuda or cpu)")
     parser.add_argument("--checkpoint", type=str, default=None, 
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--use_wandb", action="store_true", default=not WANDB_DISABLED,
@@ -757,24 +751,30 @@ def main():
     
     # Configure logging
     log_level = logging.DEBUG if args.debug else logging.INFO
+    
+    # Include local rank in log format when running with torchrun
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    log_format = f"%(asctime)s [Rank {local_rank}] [%(levelname)s] %(message)s"
+    
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format=log_format,
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler("rhofold_training.log")
+            logging.FileHandler(f"rhofold_training_rank{local_rank}.log")
         ]
     )
     
     # Set deterministic training for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+    # Base seed is the same, but each rank gets a different derived seed
+    base_seed = 42
+    torch.manual_seed(base_seed)
+    np.random.seed(base_seed)
+    random.seed(base_seed)
     
+    # Start the training process
     train(args)
 
 
 if __name__ == "__main__":
-    # Required for proper multiprocessing on Linux
-    mp.set_start_method('spawn', force=True)
     main()
