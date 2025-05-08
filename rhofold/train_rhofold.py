@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 import wandb
 import numpy as np
 from Bio.PDB import PDBParser
+from torch.cuda.amp import autocast, GradScaler
 
 # Add openfold to path
 openfold_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "openfold"))
@@ -32,7 +33,10 @@ LEARNING_RATE = 1e-4
 CHECKPOINT_EVERY = 2
 WARMUP_STEPS = 100
 SKIP_SHORT_SEQS = True  # If True, skip sequences with length > SEQ_CUTOFF
-SEQ_CUTOFF = 45
+SEQ_CUTOFF = 73
+GRAD_ACCUM_STEPS = 4   # Number of steps to accumulate gradients
+MAX_SEQ_LENGTH = 45    # Maximum sequence length to process to avoid OOM errors
+USE_FP16 = True        # Enable FP16 (half-precision) training
 
 # Set to your specific project/entity here or use environment variables
 os.environ["WANDB_API_KEY"] = "71278e965a6e50657c6b254d59ba8fac486c97dd"  # Uncomment and set your API key if needed
@@ -85,7 +89,7 @@ class RNADataset(Dataset):
             
             self.seq_ids = filtered_seq_ids
         
-        logging.info(f"Found {len(self.seq_ids)} RNA sequences with MSA data for training")
+        logging.info(f"Found {len(self.seq_ids)} RNA sequences length at most {MAX_SEQ_LENGTH} with MSA data for training")
     
     def __len__(self):
         return len(self.seq_ids)
@@ -222,6 +226,9 @@ def train(args):
                 "batch_size": BATCH_SIZE,
                 "use_evo2": USE_EVO2,
                 "skip_short_seqs": SKIP_SHORT_SEQS,
+                "precision": "fp16" if USE_FP16 else "fp32",
+                "grad_accum_steps": GRAD_ACCUM_STEPS,
+                "max_seq_length": MAX_SEQ_LENGTH,
             }
         )
         logging.info(f"Initialized wandb with project={WANDB_PROJECT}")
@@ -235,6 +242,9 @@ def train(args):
     # Initialize model
     model = RhoFold(rhofold_config).to(device)
     print(f"Number of params: {sum(p.numel() for p in model.parameters())}")
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler(enabled=USE_FP16)
     
     # If starting from a checkpoint, load it
     start_epoch = 0
@@ -260,13 +270,19 @@ def train(args):
     for epoch in range(start_epoch, NUM_EPOCHS):
         model.train()
         epoch_loss = 0
+        optimizer.zero_grad()
         
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")):
+            # Skip sequences that are too long to avoid OOM
+            seq = batch['seq'][0]
+            if len(seq) > MAX_SEQ_LENGTH:
+                print(f"Skipping sequence of length {len(seq)} > {MAX_SEQ_LENGTH}")
+                continue
+                
             # Move data to device
             seq_id = batch['seq_id'][0]
             tokens = batch['tokens'][0].to(device)
             rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
-            seq = batch['seq'][0]
             pdb_path = batch['pdb_path'][0]
             
             # Get chain ID from seq_id if available
@@ -277,36 +293,49 @@ def train(args):
             if USE_EVO2 and batch['evo2_fea'] is not None:
                 evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
             
-            # Forward pass
-            outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea)
+            print(f"Doing sequence length {len(seq)}")
+            # Forward pass with mixed precision
+            with autocast(enabled=USE_FP16, dtype=torch.float16):
+                outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea)
+                
+                # Take the last output from recycles
+                output = outputs[-1]
+                
+                # Compute FAPE loss
+                loss = compute_fape_loss(output, pdb_path, chain_id=chain_id)
+                # Scale the loss for gradient accumulation
+                loss = loss / GRAD_ACCUM_STEPS
             
-            # Take the last output from recycles
-            output = outputs[-1]
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
             
-            # Compute FAPE loss
-            loss = compute_fape_loss(output, pdb_path, chain_id=chain_id)
-            
-            # Backward pass and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            # Step if we've accumulated enough gradients
+            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
+                # Unscale before gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             
             # Print sequence length and VRAM usage information
-            print(f"Doing sequence length {len(seq)}")
             if torch.cuda.is_available():
                 print(f"Took {torch.cuda.memory_allocated() / 1024**2:.2f} MB of VRAM")
+                # Force CUDA to free memory cache if needed
+                if batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
             
-            # Track loss
-            epoch_loss += loss.item()
+            # Track loss (use the unscaled value for logging)
+            epoch_loss += loss.item() * GRAD_ACCUM_STEPS
             
             # Log batch metrics
             if args.use_wandb:
                 wandb.log({
-                    "batch_loss": loss.item(),
+                    "batch_loss": loss.item() * GRAD_ACCUM_STEPS,
                     "pLDDT": output["plddt"][1].item(),
                     "seq_id": seq_id,
-                    "seq_length": len(seq)
+                    "seq_length": len(seq),
+                    "memory_usage_MB": torch.cuda.memory_allocated() / 1024**2
                 })
         
         # Calculate average epoch loss
