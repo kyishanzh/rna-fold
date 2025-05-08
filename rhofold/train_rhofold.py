@@ -27,9 +27,9 @@ if openfold_path not in sys.path:
 from rhofold.rhofold import RhoFold
 from rhofold.config import rhofold_config
 from rhofold.utils import get_device
-from rhofold.utils.alphabet import get_features
+from rhofold.utils.alphabet import get_features, read_fas
 from openfold.utils.rigid_utils import Rigid, Rotation
-from openfold.utils.loss import compute_fape, read_fas
+from openfold.utils.loss import compute_fape
 
 # Import evaluation utilities
 from utils import eval_model, tm_score as calculate_tm_score
