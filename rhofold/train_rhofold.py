@@ -29,7 +29,7 @@ from rhofold.config import rhofold_config
 from rhofold.utils import get_device
 from rhofold.utils.alphabet import get_features
 from openfold.utils.rigid_utils import Rigid, Rotation
-from openfold.utils.loss import compute_fape
+from openfold.utils.loss import compute_fape, read_fas
 
 # Import evaluation utilities
 from utils import eval_model, tm_score as calculate_tm_score
@@ -52,17 +52,18 @@ MAX_SEQ_LENGTH = 45    # Maximum sequence length to process to avoid OOM errors
 USE_FP16 = True        # Enable FP16 (half-precision) training
 
 # Set to your specific project/entity here or use environment variables
-os.environ["WANDB_API_KEY"] = "71278e965a6e50657c6b254d59ba8fac486c97dd"  # Uncomment and set your API key if needed
-os.environ["WANDB_PROJECT"] = "rhofold"  # Uncomment to override default project
-
-# Get wandb configuration from environment or use defaults
-WANDB_API_KEY = os.environ.get("WANDB_API_KEY", None)
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rhofold")
 WANDB_DISABLED = False
 
-def setup_distributed(rank, world_size, port):
+
+def setup_distributed(rank, world_size, port=12355):
     """
-    Setup distributed training
+    Setup distributed training environment
+    
+    Args:
+        rank: Process rank
+        world_size: Total number of processes
+        port: Port number for communication
     """
     # Use the provided port (must be the same across all processes)
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -76,15 +77,18 @@ def setup_distributed(rank, world_size, port):
     np.random.seed(42 + rank)
     random.seed(42 + rank)
     
+    # Set device for this process
+    torch.cuda.set_device(rank)
+    
     # Make sure all processes are synchronized before proceeding
-    torch.cuda.synchronize()
     dist.barrier()
 
+
 def cleanup_distributed():
-    """
-    Clean up distributed training
-    """
-    dist.destroy_process_group()
+    """Clean up distributed training resources"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 
 class SequentialDistributedSampler(Sampler):
     """
@@ -114,10 +118,12 @@ class SequentialDistributedSampler(Sampler):
         # need to do anything with the epoch number
         pass
 
+
 class RNADataset(Dataset):
-    def __init__(self, data_dir, use_evo2=True):
+    def __init__(self, data_dir, use_evo2=True, max_seq_length=MAX_SEQ_LENGTH):
         self.data_dir = data_dir
         self.use_evo2 = use_evo2
+        self.max_seq_length = max_seq_length
         
         # Get sequence IDs from the directory
         seq_dir = os.path.join(data_dir, "RNA3D_DATA/seq")
@@ -143,11 +149,7 @@ class RNADataset(Dataset):
             filtered_seq_ids = []
             for seq_id in self.seq_ids:
                 input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
-                # Read sequence to check length
-                with open(input_fas, 'r') as f:
-                    # Skip header line
-                    f.readline()
-                    seq = f.readline().strip()
+                seq = read_fas(input_fas)
                     
                 if len(seq) > SEQ_CUTOFF:
                     self.skipped_long_seqs.append(seq_id)
@@ -156,7 +158,7 @@ class RNADataset(Dataset):
             
             self.seq_ids = filtered_seq_ids
         
-        logging.info(f"Found {len(self.seq_ids)} RNA sequences length at most {MAX_SEQ_LENGTH} with MSA data for training")
+        logging.info(f"Found {len(self.seq_ids)} RNA sequences length ≤ {MAX_SEQ_LENGTH} with MSA data for training")
     
     def __len__(self):
         return len(self.seq_ids)
@@ -172,7 +174,6 @@ class RNADataset(Dataset):
         # Check if tokens and rna_fm_tokens have the same last dimension
         if data_dict['tokens'].shape[-1] != data_dict['rna_fm_tokens'].shape[-1]:
             if seq_id not in self.filtered_ids:
-                # logging.warning(f"Skipping {seq_id}: tokens shape {data_dict['tokens'].shape} doesn't match rna_fm_tokens shape {data_dict['rna_fm_tokens'].shape}")
                 self.filtered_ids.append(seq_id)
             
             # Get new index by recursively calling __getitem__ with the next index
@@ -186,8 +187,6 @@ class RNADataset(Dataset):
             embedding_path = os.path.join(embeddings_dir, f"{seq_id}.pt")
             if os.path.exists(embedding_path):
                 evo2_embedding = torch.load(embedding_path)
-            else:
-                logging.warning(f"Embedding file for {seq_id} not found at {embedding_path}")
         
         # Get PDB path for ground truth
         pdb_path = os.path.join(self.data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
@@ -201,9 +200,20 @@ class RNADataset(Dataset):
             'pdb_path': pdb_path
         }
 
+
 def compute_fape_loss(output, pdb_path, chain_id=None, length_scale=10.0, l1_clamp_distance=None):
     """
     Compute FAPE loss between model output and ground truth PDB
+    
+    Args:
+        output: Dictionary containing model output predictions
+        pdb_path: Path to ground truth PDB file
+        chain_id: Optional chain ID to use from PDB
+        length_scale: Scale factor for FAPE calculation
+        l1_clamp_distance: Distance threshold for L1 clamping
+        
+    Returns:
+        FAPE loss value
     """
     # Extract predicted frames
     pred_frames_tensor = output["frames"]
@@ -277,23 +287,122 @@ def compute_fape_loss(output, pdb_path, chain_id=None, length_scale=10.0, l1_cla
     
     return fape
 
+
+def load_checkpoint(model, checkpoint_path, rank):
+    """
+    Load model checkpoint with proper handling for DDP
+    
+    Args:
+        model: DDP wrapped model
+        checkpoint_path: Path to checkpoint file
+        rank: Process rank
+        
+    Returns:
+        Starting epoch number
+    """
+    # Load checkpoint using map_location to place tensors on the right device
+    map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    
+    # Handle module prefixes in state dict
+    if any(k.startswith('module.') for k in checkpoint['model']):
+        # Model was saved with DDP
+        model.load_state_dict(checkpoint['model'], strict=False)
+    else:
+        # Model was saved without DDP, add module prefix
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in checkpoint['model'].items():
+            new_state_dict[f'module.{k}'] = v
+        model.load_state_dict(new_state_dict, strict=False)
+        
+    start_epoch = checkpoint.get('epoch', 0)
+    if rank == 0:
+        print(f"Loaded checkpoint from {checkpoint_path}, starting from epoch {start_epoch}")
+    
+    return start_epoch
+
+
+def save_checkpoint(model, optimizer, epoch, loss, path):
+    """
+    Save model checkpoint
+    
+    Args:
+        model: DDP wrapped model
+        optimizer: Optimizer state
+        epoch: Current epoch
+        loss: Current loss value
+        path: Path to save checkpoint
+    """
+    torch.save({
+        'epoch': epoch + 1,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'loss': loss,
+    }, path)
+    logging.info(f"Checkpoint saved to {path}")
+
+
+def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
+    """
+    Run evaluation on the model during training
+    
+    Args:
+        model: DDP wrapped model
+        rank: Process rank
+        world_size: Total number of processes
+        use_fp16: Whether to use mixed precision
+        
+    Returns:
+        Evaluation score (TM score)
+    """
+    # Switch model to eval mode
+    model.eval()
+    
+    # Define generator function for eval_model
+    def generator(features):
+        with torch.no_grad():
+            with autocast(enabled=use_fp16, dtype=torch.float16):
+                # Call the model's forward method directly through module to bypass DDP wrapper
+                outputs = model.module(
+                    tokens=features["tokens"], 
+                    rna_fm_tokens=features["rna_fm_tokens"], 
+                    seq=features["seq"],
+                    evo2_fea=features["evo2_fea"]
+                )
+                preds = []
+                for i in range(min(5, len(outputs))):
+                    preds.append(outputs[i]["cords_c1'"][0][0])
+                return preds
+    
+    try:
+        # Run evaluation
+        eval_score = eval_model(generator)
+        return eval_score
+    except Exception as e:
+        if rank == 0:
+            logging.error(f"Evaluation error: {str(e)}")
+        return 0.0
+
+
 def train_worker(rank, world_size, args, port):
     """
     Training process for a single worker/GPU
+    
+    Args:
+        rank: Process rank
+        world_size: Total number of processes
+        args: Command line arguments
+        port: Port number for communication
     """
     # Setup distributed process
     setup_distributed(rank, world_size, port)
     
     # Set this process's device
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
     
     # Initialize wandb only on main process
     if rank == 0 and args.use_wandb:
-        if WANDB_API_KEY:
-            wandb.login(key=WANDB_API_KEY)
-            logging.info(f"Logged into wandb with API key from environment")
-        
         wandb.init(
             project=WANDB_PROJECT,
             config={
@@ -319,63 +428,32 @@ def train_worker(rank, world_size, args, port):
     
     # Initialize model
     model = RhoFold(rhofold_config).to(device)
-    torch.compile(model)
     
-    # Important: synchronize model parameters across processes
-    # before wrapping with DDP to ensure consistent initialization
-    # Broadcast model parameters from rank 0 to all other ranks
+    # Synchronize model parameters across processes
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
     
-    # Wrap model with DDP - Enable find_unused_parameters to handle unused parameters in forward pass
-    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+    # Only use torch.compile if explicitly requested
+    # Skip compilation by default as it may not work well with this complex model
+    if args.use_compile and hasattr(torch, 'compile'):
+        try:
+            logging.info("Attempting to compile model with torch.compile()...")
+            model = torch.compile(model, dynamic=True)
+            logging.info("Model compilation successful")
+        except Exception as e:
+            logging.warning(f"Model compilation failed, using eager mode: {str(e)}")
+    else:
+        logging.info("Skipping model compilation, using eager mode")
+    
+    # Wrap model with DDP - find_unused_parameters needed for RhoFold architecture
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
     if rank == 0:
-        print(f"Number of params: {sum(p.numel() for p in model.parameters())}")
+        param_count = sum(p.numel() for p in model.parameters())
+        print(f"Model initialized with {param_count:,} parameters")
     
     # Initialize gradient scaler for mixed precision training
     scaler = GradScaler(enabled=USE_FP16)
-    
-    # If starting from a checkpoint, load it
-    start_epoch = 0
-    if args.checkpoint:
-        # Load checkpoint using map_location to place tensors on the right device
-        map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
-        checkpoint = torch.load(args.checkpoint, map_location=map_location)
-        
-        # Handle module prefixes in state dict
-        if any(k.startswith('module.') for k in checkpoint['model']):
-            # Model was saved with DDP
-            model.load_state_dict(checkpoint['model'], strict=False)
-        else:
-            # Model was saved without DDP, add module prefix
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in checkpoint['model'].items():
-                new_state_dict[f'module.{k}'] = v
-            model.load_state_dict(new_state_dict, strict=False)
-            
-        start_epoch = checkpoint.get('epoch', 0)
-        if rank == 0:
-            print(f"Loaded checkpoint from {args.checkpoint}, starting from epoch {start_epoch}")
-    
-    # Synchronize after checkpoint loading
-    dist.barrier()
-    
-    # Create dataset
-    dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2)
-    
-    # Create distributed sampler to handle sharding
-    sampler = SequentialDistributedSampler(dataset, world_size, rank)
-    
-    # Create dataloader with single batch size (no collation issues)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=BATCH_SIZE, 
-        sampler=sampler,
-        num_workers=4,
-        pin_memory=True
-    )
     
     # Initialize optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -383,6 +461,26 @@ def train_worker(rank, world_size, args, port):
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2
+    )
+    
+    # If starting from a checkpoint, load it
+    start_epoch = 0
+    if args.checkpoint:
+        start_epoch = load_checkpoint(model, args.checkpoint, rank)
+    
+    # Create dataset and dataloader
+    dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2, max_seq_length=MAX_SEQ_LENGTH)
+    
+    # Create distributed sampler
+    sampler = SequentialDistributedSampler(dataset, world_size, rank)
+    
+    # Create dataloader
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True
     )
     
     # Training loop
@@ -394,7 +492,7 @@ def train_worker(rank, world_size, args, port):
         # Set epoch for sampler
         sampler.set_epoch(epoch)
         
-        # Make sure all processes are synchronized before starting the epoch
+        # Ensure all processes are synchronized before starting the epoch
         dist.barrier()
         
         # Create progress bar on main process only
@@ -413,26 +511,16 @@ def train_worker(rank, world_size, args, port):
                     print(f"Skipping sequence of length {len(seq)} > {MAX_SEQ_LENGTH}")
                 continue
                 
-            # Move data to device
+            # Process batch data
             seq_id = batch['seq_id'][0]
             tokens = batch['tokens'][0].to(device)
             rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
             pdb_path = batch['pdb_path'][0]
             
-            # Get chain ID from seq_id if available
-            chain_id = None
-            
             # Handle evo2 features
             evo2_fea = None
             if USE_EVO2 and batch['evo2_fea'] is not None:
                 evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
-            
-            # Print info only from rank 0 to avoid console spam
-            if rank == 0:
-                print(f"[GPU {rank}] Processing sequence {seq_id} (length {len(seq)})")
-            
-            # Synchronize before each forward pass to ensure all GPUs are ready
-            torch.cuda.synchronize(device)
             
             # Forward pass with mixed precision
             with autocast(enabled=USE_FP16, dtype=torch.float16):
@@ -442,14 +530,8 @@ def train_worker(rank, world_size, args, port):
                 # Take the last output from recycles
                 output = outputs[-1]
                 
-                # Make sure to touch all output tensors to ensure proper DDP synchronization
-                # This helps with the unused parameter issue
-                for k, v in output.items():
-                    if isinstance(v, torch.Tensor) and v.requires_grad:
-                        v.sum()  # Just to make sure tensor is used
-                
                 # Compute FAPE loss
-                loss = compute_fape_loss(output, pdb_path, chain_id=chain_id)
+                loss = compute_fape_loss(output, pdb_path)
                 # Scale the loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
             
@@ -465,15 +547,9 @@ def train_worker(rank, world_size, args, port):
                 scaler.update()
                 optimizer.zero_grad()
             
-            # Synchronize after backward to ensure all processes have completed their backward pass
-            torch.cuda.synchronize(device)
-            
-            # Print sequence length and VRAM usage information
-            if rank == 0:
-                print(f"[GPU {rank}] Took {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB of VRAM")
-                # Force CUDA to free memory cache if needed
-                if batch_idx % 10 == 0:
-                    torch.cuda.empty_cache()
+            # Free memory if needed
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
             
             # Track loss
             epoch_loss += loss.item() * GRAD_ACCUM_STEPS
@@ -483,68 +559,43 @@ def train_worker(rank, world_size, args, port):
             if rank == 0 and args.use_wandb:
                 wandb.log({
                     "batch_loss": loss.item() * GRAD_ACCUM_STEPS,
-                    "pLDDT": output["plddt"][1].item(),
+                    "pLDDT": output["plddt"][1].item() if "plddt" in output else 0.0,
                     "seq_id": seq_id,
                     "seq_length": len(seq),
                     "memory_usage_MB": torch.cuda.memory_allocated(device) / 1024**2,
-                    "gpu": rank
                 })
             
             # Update progress bar on main process
             if rank == 0:
                 pbar.update(1)
                 
-            # Run evaluation every 10% of an epoch
-            if batch_idx % eval_interval == 0:
+            # Run evaluation at regular intervals
+            if (batch_idx + 1) % eval_interval == 0:
                 if rank == 0:
-                    print(f"\n[Evaluation] Running evaluation at {(batch_idx + 1) / total_batches * 100:.1f}% of epoch {epoch + 1}")
+                    print(f"\n[Evaluation] Running at {(batch_idx + 1) / total_batches * 100:.1f}% of epoch {epoch + 1}")
                 
-                # Make sure all processes are synchronized before evaluation
+                # Ensure all processes are synchronized before evaluation
                 dist.barrier()
                 
-                # Switch model to eval mode
-                model.eval()
+                # Run evaluation
+                eval_score = evaluate_model(model, rank, world_size, use_fp16=USE_FP16)
                 
-                try:
-                    # Define generator function for eval_model
-                    def generator(features):
-                        with torch.no_grad():
-                            with autocast(enabled=USE_FP16, dtype=torch.float16):
-                                # Call the model's forward method directly through module to bypass DDP wrapper
-                                outputs = model.module(
-                                    tokens=features["tokens"], 
-                                    rna_fm_tokens=features["rna_fm_tokens"], 
-                                    seq=features["seq"],
-                                    evo2_fea=features["evo2_fea"]
-                                )
-                                preds = []
-                                for i in range(min(5, len(outputs))):
-                                    preds.append(outputs[i]["cords_c1'"][0][0])
-                                return preds
-                    
-                    # Run evaluation
-                    eval_score = eval_model(generator)
-                    
-                    # Log evaluation metrics on main process
-                    if rank == 0 and args.use_wandb:
-                        wandb.log({
-                            "epoch": epoch + 1,
-                            "progress": (batch_idx + 1) / total_batches,
-                            "tm_score": eval_score
-                        })
-                        print(f"[Evaluation] TM Score: {eval_score:.4f}")
-                except Exception as e:
-                    if rank == 0:
-                        print(f"[Evaluation] Error during evaluation: {str(e)}")
-                        logging.error(f"Evaluation error: {str(e)}")
+                # Log evaluation metrics on main process
+                if rank == 0 and args.use_wandb and eval_score > 0:
+                    wandb.log({
+                        "epoch": epoch + 1,
+                        "progress": (batch_idx + 1) / total_batches,
+                        "tm_score": eval_score
+                    })
+                    print(f"[Evaluation] TM Score: {eval_score:.4f}")
                 
-                # Make sure all processes are synchronized after evaluation
+                # Ensure all processes are synchronized after evaluation
                 dist.barrier()
                 
-                # Switch back to train mode
+                # Return to train mode
                 model.train()
                 
-                # Empty cuda cache after evaluation to free up memory
+                # Free memory after evaluation
                 torch.cuda.empty_cache()
         
         # Close progress bar on main process
@@ -555,7 +606,6 @@ def train_worker(rank, world_size, args, port):
         dist.barrier()
         
         # Calculate average epoch loss
-        # Gather losses from all GPUs
         if processed_batches > 0:
             avg_loss = epoch_loss / processed_batches
         else:
@@ -596,13 +646,7 @@ def train_worker(rank, world_size, args, port):
         # Save checkpoint (on main process only)
         if (epoch + 1) % CHECKPOINT_EVERY == 0 and rank == 0:
             checkpoint_path = os.path.join(CHECKPOINT_DIR, f"rhofold_epoch_{epoch+1}.pt")
-            torch.save({
-                'epoch': epoch + 1,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'loss': avg_loss,
-            }, checkpoint_path)
-            print(f"Checkpoint saved to {checkpoint_path}")
+            save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_path)
         
         # Make sure all processes sync up before starting next epoch
         dist.barrier()
@@ -610,23 +654,15 @@ def train_worker(rank, world_size, args, port):
     # Save final model (on main process only)
     if rank == 0:
         final_checkpoint_path = os.path.join(CHECKPOINT_DIR, "rhofold_final.pt")
-        torch.save({
-            'epoch': NUM_EPOCHS,
-            'model': model.state_dict(),
-            'loss': avg_loss,
-        }, final_checkpoint_path)
+        save_checkpoint(model, optimizer, NUM_EPOCHS - 1, avg_loss, final_checkpoint_path)
         
         # Print summary of filtered sequences
         if hasattr(dataset, 'filtered_ids') and dataset.filtered_ids:
-            logging.info(f"Filtered {len(dataset.filtered_ids)} sequences due to token shape mismatch:")
-            for seq_id in dataset.filtered_ids:
-                logging.info(f"  - {seq_id}")
+            logging.info(f"Filtered {len(dataset.filtered_ids)} sequences due to token shape mismatch")
         
         # Print summary of skipped long sequences
         if hasattr(dataset, 'skipped_long_seqs') and dataset.skipped_long_seqs:
-            logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {SEQ_CUTOFF}:")
-            for seq_id in dataset.skipped_long_seqs:
-                logging.info(f"  - {seq_id}")
+            logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {SEQ_CUTOFF}")
         
         if args.use_wandb:
             wandb.finish()
@@ -636,26 +672,69 @@ def train_worker(rank, world_size, args, port):
     dist.barrier()  # Final sync point
     cleanup_distributed()
 
+
 def train(args):
+    """
+    Main training function that sets up distributed training
+    
+    Args:
+        args: Command line arguments
+    """
     # Get number of available GPUs
     world_size = torch.cuda.device_count()
     
-    # Select a random port before spawning processes to ensure all processes use the same port
+    # Select a random port for distributed communication
     port = 12355 + random.randint(0, 1000)
     
-    if world_size > 1:
-        logging.info(f"Found {world_size} GPUs, using DistributedDataParallel for training on port {port}")
-        # Launch multiple processes, one per GPU
-        mp.spawn(
-            train_worker,
-            args=(world_size, args, port),
-            nprocs=world_size,
-            join=True
-        )
-    else:
-        logging.info("Found only 1 GPU, using single device training")
-        # Just run on a single GPU (rank 0)
-        train_worker(0, 1, args, port)
+    try:
+        if world_size > 1:
+            logging.info(f"Found {world_size} GPUs, using DistributedDataParallel for training on port {port}")
+            # Launch multiple processes, one per GPU
+            mp.spawn(
+                train_worker,
+                args=(world_size, args, port),
+                nprocs=world_size,
+                join=True
+            )
+        else:
+            logging.info("Found only 1 GPU, using single device training")
+            # Just run on a single GPU (rank 0)
+            train_worker(0, 1, args, port)
+    except Exception as e:
+        logging.error(f"Training failed with error: {str(e)}")
+        # Make sure to clean up in case of error
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        
+        # Clean up any leaked semaphores
+        try:
+            import subprocess
+            # Find semaphores created by this user
+            result = subprocess.run(["ipcs", "-s"], capture_output=True, text=True)
+            semaphore_lines = result.stdout.strip().split("\n")
+            
+            # Get username for filtering
+            import getpass
+            username = getpass.getuser()
+            
+            # Extract semaphore IDs owned by this user
+            semaphore_ids = []
+            for line in semaphore_lines:
+                if username in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        semaphore_ids.append(parts[1])
+            
+            # Remove each semaphore
+            for sem_id in semaphore_ids:
+                subprocess.run(["ipcrm", "-s", sem_id])
+                logging.info(f"Cleaned up semaphore {sem_id}")
+        except Exception as cleanup_error:
+            logging.warning(f"Failed to clean up semaphores: {str(cleanup_error)}")
+        
+        # Re-raise the original exception
+        raise
+
 
 def main():
     # Set environment variable to help debug DDP unused parameters
@@ -672,6 +751,8 @@ def main():
                         help="Whether to use Weights & Biases for logging")
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable debug mode with more verbose logging")
+    parser.add_argument("--use_compile", action="store_true", default=False,
+                        help="Attempt to use torch.compile() to optimize model (may not work for all models)")
     args = parser.parse_args()
     
     # Configure logging
@@ -692,7 +773,8 @@ def main():
     
     train(args)
 
+
 if __name__ == "__main__":
     # Required for proper multiprocessing on Linux
     mp.set_start_method('spawn', force=True)
-    main() 
+    main()
