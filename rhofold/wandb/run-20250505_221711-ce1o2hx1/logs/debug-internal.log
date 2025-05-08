@@ -1,8 +1,0 @@
-{"time":"2025-05-05T22:17:11.900446286Z","level":"INFO","msg":"using version","core version":"0.18.7"}
-{"time":"2025-05-05T22:17:11.900484192Z","level":"INFO","msg":"created symlink","path":"/home/user/rna-fold/rhofold/wandb/run-20250505_221711-ce1o2hx1/logs/debug-core.log"}
-{"time":"2025-05-05T22:17:12.00559742Z","level":"INFO","msg":"created new stream","id":"ce1o2hx1"}
-{"time":"2025-05-05T22:17:12.005701838Z","level":"INFO","msg":"stream: started","id":"ce1o2hx1"}
-{"time":"2025-05-05T22:17:12.005757402Z","level":"INFO","msg":"writer: Do: started","stream_id":"ce1o2hx1"}
-{"time":"2025-05-05T22:17:12.00578664Z","level":"INFO","msg":"handler: started","stream_id":"ce1o2hx1"}
-{"time":"2025-05-05T22:17:12.005880044Z","level":"INFO","msg":"sender: started","stream_id":"ce1o2hx1"}
-{"time":"2025-05-05T22:17:12.178803305Z","level":"INFO","msg":"Starting system monitor"}
