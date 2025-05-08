@@ -145,21 +145,37 @@ class RNADataset(Dataset):
         
         # Track filtered out sequences
         self.filtered_ids = []
+        self.missing_pdb_ids = []
+        self.skipped_long_seqs = []
         
-        # Skip sequences longer than MAX_SEQ_LENGTH if SKIP_SHORT_SEQS is enabled
-        if SKIP_SHORT_SEQS:
-            filtered_seq_ids = []
-            for seq_id in self.seq_ids:
+        # Filter out sequences with missing PDB files
+        filtered_seq_ids = []
+        for seq_id in self.seq_ids:
+            pdb_path = os.path.join(data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
+            if not os.path.exists(pdb_path):
+                self.missing_pdb_ids.append(seq_id)
+                continue
+                
+            # Skip sequences longer than MAX_SEQ_LENGTH if SKIP_SHORT_SEQS is enabled
+            if SKIP_SHORT_SEQS:
                 input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
                 # Read sequence to check length
                 seq = read_fas(input_fas)[0][1]
                     
                 if len(seq) <= MAX_SEQ_LENGTH:
                     filtered_seq_ids.append(seq_id)
-            
-            self.seq_ids = filtered_seq_ids
+                else:
+                    self.skipped_long_seqs.append(seq_id)
+            else:
+                filtered_seq_ids.append(seq_id)
         
-        logging.info(f"Found {len(self.seq_ids)} RNA sequences length ≤ {MAX_SEQ_LENGTH} with MSA data for training")
+        self.seq_ids = filtered_seq_ids
+        
+        logging.info(f"Found {len(self.seq_ids)} RNA sequences with valid PDB files for training")
+        if self.missing_pdb_ids:
+            logging.info(f"Filtered out {len(self.missing_pdb_ids)} sequences with missing PDB files")
+        if self.skipped_long_seqs:
+            logging.info(f"Skipped {len(self.skipped_long_seqs)} sequences with length > {MAX_SEQ_LENGTH}")
     
     def __len__(self):
         return len(self.seq_ids)
@@ -191,6 +207,8 @@ class RNADataset(Dataset):
         
         # Get PDB path for ground truth
         pdb_path = os.path.join(self.data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
+        # This check is redundant now, but kept for safety
+        assert os.path.exists(pdb_path), f"PDB file not found: {pdb_path}"
 
         return {
             'seq_id': seq_id,
@@ -369,18 +387,25 @@ def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
     # Define generator function for eval_model
     def generator(features):
         with torch.no_grad():
-            with autocast(enabled=use_fp16, dtype=torch.float16):
-                # Call the model's forward method directly through module to bypass DDP wrapper
-                outputs = model.module(
-                    tokens=features["tokens"], 
-                    rna_fm_tokens=features["rna_fm_tokens"], 
-                    seq=features["seq"],
-                    evo2_fea=features["evo2_fea"]
-                )
-                preds = []
-                for i in range(min(5, len(outputs))):
-                    preds.append(outputs[i]["cords_c1'"][0][0])
-                return preds
+            # Convert input tensors to float32 to ensure consistent dtype
+            # Convert evolutionary features to float32 for consistent precision
+            if "evo2_fea" in features:
+                features["evo2_fea"] = features["evo2_fea"].to(torch.float32)
+            
+            # Disable autocast to avoid mixed precision
+            outputs = model.module(
+                tokens=features["tokens"].to(model.device), 
+                rna_fm_tokens=features["rna_fm_tokens"].to(model.device), 
+                seq=features["seq"],
+                evo2_fea=features["evo2_fea"].to(model.device)
+            )
+            
+            # Convert all output tensors to float32
+            preds = []
+            for i in range(min(5, len(outputs))):
+                # Ensure all tensors are float32
+                preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
+            return preds
     
     try:
         # Run evaluation
@@ -388,7 +413,10 @@ def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
         return eval_score
     except Exception as e:
         if rank == 0:
+            # More detailed error reporting
+            import traceback
             logging.error(f"Evaluation error: {str(e)}")
+            logging.error(traceback.format_exc())
         return 0.0
 
 
@@ -661,6 +689,10 @@ def train_worker(args):
         if hasattr(dataset, 'filtered_ids') and dataset.filtered_ids:
             logging.info(f"Filtered {len(dataset.filtered_ids)} sequences due to token shape mismatch")
         
+        # Print summary of sequences with missing PDB files
+        if hasattr(dataset, 'missing_pdb_ids') and dataset.missing_pdb_ids:
+            logging.info(f"Filtered {len(dataset.missing_pdb_ids)} sequences due to missing PDB files")
+            
         # Print summary of skipped long sequences
         if hasattr(dataset, 'skipped_long_seqs') and dataset.skipped_long_seqs:
             logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {MAX_SEQ_LENGTH}")

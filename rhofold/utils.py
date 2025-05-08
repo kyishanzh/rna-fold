@@ -88,7 +88,7 @@ def prepare_ds():
 id_to_seq, id_to_loc = prepare_ds()
 
 
-def split_to_csv(csv_path, split="train"):  # train, val, test
+def split_to_csv(split="train"):  # train, val, test
     if split == "train":
         csv_path = train_csv
     elif split == "val":
@@ -119,8 +119,8 @@ def g_features(seq_id):
 
     return {
         "seq": features["seq"],
-        "tokens": torch.tensor(features["tokens"]).cuda(),
-        "rna_fm_tokens": torch.tensor(features["rna_fm_tokens"]).cuda(),
+        "tokens": features["tokens"].cuda(),
+        "rna_fm_tokens": features["rna_fm_tokens"].cuda(),
         "evo2_fea": torch.tensor(evo2_fea).cuda(),
     }
 
@@ -176,7 +176,7 @@ def eval_model(generator):
     """
     generator: a function that takes in features, and obtain a sample
     """
-    val_idx = all_seq_ids("val")
+    val_idx = all_seq_ids("train")
     if is_main_process():
         print(f"Evaluating {len(val_idx)} sequences")
     score_list = []

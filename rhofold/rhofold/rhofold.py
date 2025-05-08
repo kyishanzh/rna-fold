@@ -56,6 +56,9 @@ class RhoFold(nn.Module):
             config.globals.evo2_dim,
             config.model.e2eformer_stack.c_s
         )
+        # Initialize weights and bias to 0
+        nn.init.zeros_(self.evo2_head.weight)
+        nn.init.zeros_(self.evo2_head.bias)
 
 
     def forward_cords(self, tokens, single_fea, pair_fea, seq):
