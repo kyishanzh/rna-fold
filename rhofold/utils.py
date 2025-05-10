@@ -115,7 +115,7 @@ def g_features(seq_id):
         msa_fpath=msa_path,
         msa_depth=128,  # You can adjust this if you want to use more/fewer sequences from the MSA
     )
-    evo2_fea = evo2_features[seq_id]
+    evo2_fea = torch.load(f"{data_folder}evo2_embeddings/{seq_id}.pt")
 
     return {
         "seq": features["seq"],
@@ -142,10 +142,62 @@ def kabsch_align(P, Q):
     return P_aligned, Q_centered
 
 
-def tm_score(P, Q):
-    # P: predicted coords, Q: true coords, both [L, 3]
-    L = P.shape[0]
-    d0 = 0.0
+# def tm_score(P, Q):
+#     # P: predicted coords, Q: true coords, both [L, 3]
+#     L = P.shape[0]
+#     d0 = 0.0
+#     if L < 12:
+#         d0 = 0.3
+#     elif L < 16:
+#         d0 = 0.4
+#     elif L < 20:
+#         d0 = 0.5
+#     elif L < 24:
+#         d0 = 0.6
+#     elif L < 30:
+#         d0 = 0.7
+#     else:
+#         d0 = 0.6 * (L - 0.5) ** 0.5 - 2.5
+
+#     P_aligned, Q_centered = kabsch_align(P, Q)
+#     dist = torch.norm(P_aligned - Q_centered, dim=1)
+#     score = (1 / (1 + (dist / d0) ** 2)).mean()
+#     return score.item()
+
+@torch.no_grad()
+def tm_score(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """
+    Compute classic TM-score between two [L,3] tensors.
+    Inputs are atomic positions already matched by index.
+    Returns a scalar (tensor) in [0,1].
+
+    Steps
+    1. center each structure
+    2. find best rotation with Kabsch to superimpose X onto Y
+    3. apply rotation, grab pairwise distances
+    4. plug into TM formula with length-dependent d0
+    """
+    assert X.shape == Y.shape and X.dim() == 2 and X.size(1) == 3, "need [L,3] vs [L,3]"
+    L = X.size(0)
+
+    # 1. shift to center of mass
+    Xc = X - X.mean(0, keepdim=True)
+    Yc = Y - Y.mean(0, keepdim=True)
+
+    # 2. kabsch – covariance & SVD
+    C = Xc.t() @ Yc
+    V, S, Wt = torch.linalg.svd(C)
+    # handle possible improper rotation
+    d = torch.det(V @ Wt)
+    D = torch.diag(torch.tensor([1, 1, torch.sign(d)], device=V.device))
+    R = V @ D @ Wt
+
+    # 3. rotate Xc
+    X_aligned = Xc @ R
+
+    # 4. distances
+    dists = torch.linalg.vector_norm(X_aligned - Yc, dim=1)
+
     if L < 12:
         d0 = 0.3
     elif L < 16:
@@ -159,18 +211,12 @@ def tm_score(P, Q):
     else:
         d0 = 0.6 * (L - 0.5) ** 0.5 - 2.5
 
-    P_aligned, Q_centered = kabsch_align(P, Q)
-    dist = torch.norm(P_aligned - Q_centered, dim=1)
-    score = (1 / (1 + (dist / d0) ** 2)).mean()
-    return score.item()
+    tm = torch.mean(1.0 / (1.0 + (dists / d0) ** 2))
+    return tm.item()
 
 
 import torch.distributed as dist
 from tqdm import tqdm
-
-with open("/dev/shm/nvidia_evo2_full_embeddings.pkl", "rb") as f:
-    evo2_features = pickle.load(f)
-
 
 def eval_model(generator):
     """

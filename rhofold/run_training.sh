@@ -27,6 +27,10 @@ while [[ $# -gt 0 ]]; do
       USE_WANDB=true
       shift
       ;;
+    --no_wandb)
+      USE_WANDB=false
+      shift
+      ;;
     --checkpoint)
       CHECKPOINT="$2"
       shift 2

@@ -42,18 +42,18 @@ CHECKPOINT_DIR = "checkpoints"
 USE_EVO2 = True
 BATCH_SIZE = 1  # Keep batch size at 1 for each GPU
 NUM_EPOCHS = 20
-LEARNING_RATE = 4e-4
+LEARNING_RATE = 2e-4
 CHECKPOINT_EVERY = 2
 WARMUP_STEPS = 100
 SKIP_SHORT_SEQS = True  # If True, skip sequences with length > MAX_SEQ_LENGTH
 GRAD_ACCUM_STEPS = 4   # Number of steps to accumulate gradients
-MAX_SEQ_LENGTH = 45    # Maximum sequence length to process to avoid OOM errors
+MAX_SEQ_LENGTH = 250    # Maximum sequence length to process to avoid OOM errors
 USE_FP16 = True        # Enable FP16 (half-precision) training
+WEIGHT_DECAY = 0.01    # Weight decay for regularization 
+DROPOUT_RATE = 0.1     # Dropout rate for regularization
 
 # Set to your specific project/entity here or use environment variables
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rhofold")
-WANDB_DISABLED = False
-
 
 def setup_distributed():
     """
@@ -152,17 +152,28 @@ class RNADataset(Dataset):
         filtered_seq_ids = []
         for seq_id in self.seq_ids:
             pdb_path = os.path.join(data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
+            input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
+            # Read sequence to check length
+            seq = read_fas(input_fas)[0][1]
             if not os.path.exists(pdb_path):
                 self.missing_pdb_ids.append(seq_id)
                 continue
-                
+            try:
+                f = open(pdb_path, "r")
+            except:
+                self.missing_pdb_ids.append(seq_id)
+                continue
+            lines = f.readlines()
+            f.close()
+            if len(lines) < len(seq) / 2:
+                self.missing_pdb_ids.append(seq_id)
+                continue
+            if not lines[0].startswith("ATOM"):
+                self.missing_pdb_ids.append(seq_id)
+                continue
             # Skip sequences longer than MAX_SEQ_LENGTH if SKIP_SHORT_SEQS is enabled
             if SKIP_SHORT_SEQS:
-                input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
-                # Read sequence to check length
-                seq = read_fas(input_fas)[0][1]
-                    
-                if len(seq) <= MAX_SEQ_LENGTH:
+                if len(seq) <= MAX_SEQ_LENGTH and len(seq) > 220:
                     filtered_seq_ids.append(seq_id)
                 else:
                     self.skipped_long_seqs.append(seq_id)
@@ -461,6 +472,11 @@ def train_worker(args):
     # Initialize model
     model = RhoFold(rhofold_config).to(device)
     
+    # Set dropout rate in model
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = DROPOUT_RATE
+    
     # Synchronize model parameters across processes
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
@@ -487,12 +503,23 @@ def train_worker(args):
     # Initialize gradient scaler for mixed precision training
     scaler = GradScaler(enabled=USE_FP16)
     
-    # Initialize optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # Initialize optimizer with weight decay
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2
+    # Create warmup scheduler
+    def get_warmup_lr_lambda(current_step):
+        if current_step < WARMUP_STEPS:
+            return float(current_step) / float(max(1, WARMUP_STEPS))
+        return 1.0
+    
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_warmup_lr_lambda)
+    
+    # Learning rate scheduler - will be used after warmup
+    # Replace ReduceLROnPlateau with CosineAnnealingLR for cosine decay
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=NUM_EPOCHS,  # Full cosine cycle over remaining epochs
+        eta_min=LEARNING_RATE * 0.01  # Minimum learning rate will be 1% of initial rate
     )
     
     # If starting from a checkpoint, load it
@@ -516,6 +543,7 @@ def train_worker(args):
     )
     
     # Training loop
+    global_step = 0
     for epoch in range(start_epoch, NUM_EPOCHS):
         model.train()
         epoch_loss = 0
@@ -536,70 +564,9 @@ def train_worker(args):
         eval_interval = max(1, total_batches // 10)  # Evaluate every 10% of an epoch
         
         for batch_idx, batch in enumerate(dataloader):
-            # Skip sequences that are too long to avoid OOM
-            seq = batch['seq'][0]
-            assert len(seq) <= MAX_SEQ_LENGTH, f"Sequence length {len(seq)} > {MAX_SEQ_LENGTH}"
-                
-            # Process batch data
-            seq_id = batch['seq_id'][0]
-            tokens = batch['tokens'][0].to(device)
-            rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
-            pdb_path = batch['pdb_path'][0]
-            while tokens.dim() < 3:
-                tokens = tokens.unsqueeze(0)
-            while rna_fm_tokens.dim() < 2:
-                rna_fm_tokens = rna_fm_tokens.unsqueeze(0)
-            
-            # Handle evo2 features
-            evo2_fea = None
-            if USE_EVO2 and batch['evo2_fea'] is not None:
-                evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
-            
-            # Forward pass with mixed precision
-            with autocast(enabled=USE_FP16, dtype=torch.float16):
-                # Run model forward pass
-                outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea)
-                
-                # Take the last output from recycles
-                output = outputs[-1]
-                
-                # Compute FAPE loss
-                loss = compute_fape_loss(output, pdb_path)
-                # Scale the loss for gradient accumulation
-                loss = loss / GRAD_ACCUM_STEPS
-
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
-            
-            # Step if we've accumulated enough gradients
-            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
-                # Unscale before gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-            
-            # Track loss
-            epoch_loss += loss.item() * GRAD_ACCUM_STEPS
-            processed_batches += 1
-            
-            # Log batch metrics on main process
-            if rank == 0 and args.use_wandb:
-                wandb.log({
-                    "batch_loss": loss.item() * GRAD_ACCUM_STEPS,
-                    "pLDDT": output["plddt"][1].item() if "plddt" in output else 0.0,
-                    "seq_id": seq_id,
-                    "seq_length": len(seq),
-                    "memory_usage_MB": torch.cuda.memory_allocated(device) / 1024**2,
-                })
-            
-            # Update progress bar on main process
-            if rank == 0:
-                pbar.update(1)
-                
             # Run evaluation at regular intervals
             if batch_idx % eval_interval == 0:
+                model.eval()
                 if rank == 0:
                     print(f"\n[Evaluation] Running at {(batch_idx + 1) / total_batches * 100:.1f}% of epoch {epoch + 1}")
                 
@@ -626,6 +593,82 @@ def train_worker(args):
                 
                 # Free memory after evaluation
                 torch.cuda.empty_cache()
+            
+            # Skip sequences that are too long to avoid OOM
+            seq = batch['seq'][0]
+            assert len(seq) <= MAX_SEQ_LENGTH, f"Sequence length {len(seq)} > {MAX_SEQ_LENGTH}"
+                
+            # Process batch data
+            seq_id = batch['seq_id'][0]
+            tokens = batch['tokens'][0].to(device)
+            rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
+            pdb_path = batch['pdb_path'][0]
+            while tokens.dim() < 3:
+                tokens = tokens.unsqueeze(0)
+            while rna_fm_tokens.dim() < 2:
+                rna_fm_tokens = rna_fm_tokens.unsqueeze(0)
+            
+            # Handle evo2 features
+            evo2_fea = None
+            if USE_EVO2 and batch['evo2_fea'] is not None:
+                evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
+            
+            logging.info(f"Processing sequence {seq_id} with length {len(seq)}")
+            # Forward pass with mixed precision
+            with autocast(enabled=USE_FP16, dtype=torch.float16):
+                # Run model forward pass
+                outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
+                
+                # Take the last output from recycles
+                output = outputs[-1]
+                
+                # Compute FAPE loss
+                loss = compute_fape_loss(output, pdb_path)
+                # Scale the loss for gradient accumulation
+                loss = loss / GRAD_ACCUM_STEPS
+            
+            logging.info(f"finished forward pass")
+
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            logging.info(f"finished backward pass")
+            
+            # Step if we've accumulated enough gradients
+            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
+                # Unscale before gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            logging.info(f"finished step")
+            # Track loss
+            epoch_loss += loss.item() * GRAD_ACCUM_STEPS
+            processed_batches += 1
+            
+            # Log batch metrics on main process
+            if rank == 0 and args.use_wandb:
+                wandb.log({
+                    "batch_loss": loss.item() * GRAD_ACCUM_STEPS,
+                    "pLDDT": output["plddt"][1].item() if "plddt" in output else 0.0,
+                    "seq_id": seq_id,
+                    "seq_length": len(seq),
+                    "memory_usage_MB": torch.cuda.memory_allocated(device) / 1024**2,
+                })
+            
+            # Update progress bar on main process
+            if rank == 0:
+                pbar.update(1)
+                
+            # Update global step
+            global_step += 1
+            
+            # Apply warmup scheduler if still in warmup phase
+            if global_step <= WARMUP_STEPS:
+                warmup_scheduler.step()
+                if rank == 0 and global_step % 10 == 0:
+                    print(f"Warmup step {global_step}/{WARMUP_STEPS}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Close progress bar on main process
         if rank == 0:
@@ -661,9 +704,9 @@ def train_worker(args):
                     "processed_sequences": total_processed
                 })
         
-        # Update learning rate scheduler (on main process only)
-        if rank == 0:
-            scheduler.step(avg_loss)
+        # Update learning rate scheduler (on main process only - after warmup)
+        if rank == 0 and global_step > WARMUP_STEPS:
+            scheduler.step()
             
             # Broadcast new learning rate to all processes
             for i, param_group in enumerate(optimizer.param_groups):
@@ -765,7 +808,7 @@ def main():
                         help="Directory containing RNA data")
     parser.add_argument("--checkpoint", type=str, default=None, 
                         help="Path to checkpoint to resume training from")
-    parser.add_argument("--use_wandb", action="store_true", default=not WANDB_DISABLED,
+    parser.add_argument("--use_wandb", action="store_true", default=False,
                         help="Whether to use Weights & Biases for logging")
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable debug mode with more verbose logging")

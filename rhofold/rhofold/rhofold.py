@@ -14,11 +14,39 @@ import torch
 import torch.nn as nn
 
 from rhofold.model.embedders import MSAEmbedder, RecyclingEmbedder
+import random
 from rhofold.model.e2eformer import E2EformerStack
 from rhofold.model.structure_module import StructureModule
 from rhofold.model.heads import DistHead, SSHead, pLDDTHead
 from rhofold.utils.tensor_utils import add
 from rhofold.utils import exists
+
+
+class Evo2Embedder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.linear1 = nn.Linear(
+            config.globals.evo2_dim,
+            config.globals.evo2_dim // 2,
+        )
+        self.linear2 = nn.Linear(
+            config.globals.evo2_dim // 2,
+            config.model.e2eformer_stack.c_s
+        )
+        self.linear3 = nn.Linear(
+            config.model.e2eformer_stack.c_s,
+            config.model.e2eformer_stack.c_s,
+        )
+        self.SwiGLU = nn.SiLU()
+
+    def forward(self, evo2_fea):
+        x = self.linear1(evo2_fea)
+        x = self.SwiGLU(x)
+        x = self.linear2(x)
+        x = self.SwiGLU(x)
+        x = self.linear3(x)
+        return x
 
 
 class RhoFold(nn.Module):
@@ -52,13 +80,9 @@ class RhoFold(nn.Module):
         self.plddt_head = pLDDTHead(
             **config.model.heads.plddt,
         )
-        self.evo2_head = nn.Linear(
-            config.globals.evo2_dim,
-            config.model.e2eformer_stack.c_s
-        )
-        # Initialize weights and bias to 0
-        nn.init.zeros_(self.evo2_head.weight)
-        nn.init.zeros_(self.evo2_head.bias)
+        self.evo2_head = Evo2Embedder(config)
+        for p in self.evo2_head.parameters():
+            p.data.zero_()
 
 
     def forward_cords(self, tokens, single_fea, pair_fea, seq):
@@ -76,7 +100,7 @@ class RhoFold(nn.Module):
 
         return output
 
-    def forward_one_cycle(self, tokens, rna_fm_tokens, recycling_inputs, seq, evo2_fea=None):
+    def forward_one_cycle(self, tokens, rna_fm_tokens, recycling_inputs, seq, evo2_fea=None, train=False):
         '''
         Args:
             tokens: [bs, seq_len, c_z]
@@ -135,6 +159,15 @@ class RhoFold(nn.Module):
         """
 
         recycling_inputs = None
+
+        if kwargs.get("train", False):
+            cycles = random.randint(1, self.config.model.recycling_embedder.recycles)
+            for _r in range(cycles-1):
+                with torch.no_grad():
+                    _, recycling_inputs = \
+                        self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq, **kwargs)
+            output, _ = self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq, **kwargs)
+            return [output]
 
         outputs = []
         for _r in range(self.config.model.recycling_embedder.recycles):
