@@ -152,6 +152,8 @@ class RNADataset(Dataset):
         # Filter out sequences with missing PDB files
         filtered_seq_ids = []
         for seq_id in self.seq_ids:
+            if seq_id == '4v9r_BB':
+                continue
             pdb_path = os.path.join(data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
             input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
             # Read sequence to check length
@@ -215,13 +217,14 @@ class RNADataset(Dataset):
         if self.use_evo2:
             embeddings_dir = os.path.join(self.data_dir, "RNA3D_DATA/evo2_embeddings")
             embedding_path = os.path.join(embeddings_dir, f"{seq_id}.pt")
-            if os.path.exists(embedding_path):
-                evo2_embedding = torch.load(embedding_path)
+            evo2_embedding = torch.load(embedding_path)
         
         # Get PDB path for ground truth
         pdb_path = os.path.join(self.data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
         # This check is redundant now, but kept for safety
         assert os.path.exists(pdb_path), f"PDB file not found: {pdb_path}"
+
+        assert None not in [seq_id, data_dict['tokens'], data_dict['rna_fm_tokens'], data_dict['seq'], evo2_embedding, pdb_path]
 
         return {
             'seq_id': seq_id,
