@@ -7,6 +7,7 @@ import time
 import random
 import socket
 import multiprocessing as mp
+import datetime
 
 import torch
 import torch.nn as nn
@@ -173,14 +174,15 @@ class RNADataset(Dataset):
                 continue
             # Skip sequences longer than MAX_SEQ_LENGTH if SKIP_SHORT_SEQS is enabled
             if SKIP_SHORT_SEQS:
-                if len(seq) <= MAX_SEQ_LENGTH and len(seq) > 220:
+                if len(seq) <= MAX_SEQ_LENGTH:
                     filtered_seq_ids.append(seq_id)
                 else:
                     self.skipped_long_seqs.append(seq_id)
             else:
                 filtered_seq_ids.append(seq_id)
         
-        self.seq_ids = filtered_seq_ids
+        true_len = (len(filtered_seq_ids) // 8) * 8
+        self.seq_ids = filtered_seq_ids[:true_len]
         
         logging.info(f"Found {len(self.seq_ids)} RNA sequences with valid PDB files for training")
         if self.missing_pdb_ids:
@@ -380,55 +382,40 @@ def save_checkpoint(model, optimizer, epoch, loss, path):
 
 
 def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
-    """
-    Run evaluation on the model during training
-    
-    Args:
-        model: DDP wrapped model
-        rank: Process rank
-        world_size: Total number of processes
-        use_fp16: Whether to use mixed precision
-        
-    Returns:
-        Evaluation score (TM score)
-    """
-    # Switch model to eval mode
+    logging.info(f"[Rank {rank}] Starting evaluation")
     model.eval()
     
-    # Define generator function for eval_model
     def generator(features):
+        logging.info(f"[Rank {rank}] Processing sequence {features.get('seq_id', 'unknown')}")
         with torch.no_grad():
-            # Convert input tensors to float32 to ensure consistent dtype
-            # Convert evolutionary features to float32 for consistent precision
-            if "evo2_fea" in features:
-                features["evo2_fea"] = features["evo2_fea"].to(torch.float32)
-            
-            # Disable autocast to avoid mixed precision
-            outputs = model.module(
-                tokens=features["tokens"].to(model.device), 
-                rna_fm_tokens=features["rna_fm_tokens"].to(model.device), 
-                seq=features["seq"],
-                evo2_fea=features["evo2_fea"].to(model.device)
-            )
-            
-            # Convert all output tensors to float32
-            preds = []
-            for i in range(min(5, len(outputs))):
-                # Ensure all tensors are float32
-                preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
-            return preds
+            try:
+                if "evo2_fea" in features:
+                    features["evo2_fea"] = features["evo2_fea"].to(torch.float32)
+                
+                outputs = model.module(
+                    tokens=features["tokens"].to(model.device),
+                    rna_fm_tokens=features["rna_fm_tokens"].to(model.device),
+                    seq=features["seq"],
+                    evo2_fea=features["evo2_fea"].to(model.device) if "evo2_fea" in features else None
+                )
+                
+                preds = []
+                for i in range(min(5, len(outputs))):
+                    preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
+                return preds
+            except Exception as e:
+                import traceback
+                return []
     
     try:
-        # Run evaluation
-        eval_score = eval_model(generator)
+        # Set a per-sequence timeout for evaluation (20 seconds per sequence)
+        eval_score = eval_model(generator, timeout_per_seq=20)
         return eval_score
     except Exception as e:
-        if rank == 0:
-            # More detailed error reporting
-            import traceback
-            logging.error(f"Evaluation error: {str(e)}")
-            logging.error(traceback.format_exc())
-        return 0.0
+        return 0.0  # Return default score on error
+    finally:
+        # Ensure we return to training mode
+        model.train()
 
 
 def train_worker(args):
@@ -545,7 +532,6 @@ def train_worker(args):
     # Training loop
     global_step = 0
     for epoch in range(start_epoch, NUM_EPOCHS):
-        model.train()
         epoch_loss = 0
         optimizer.zero_grad()
         
@@ -564,14 +550,14 @@ def train_worker(args):
         eval_interval = max(1, total_batches // 10)  # Evaluate every 10% of an epoch
         
         for batch_idx, batch in enumerate(dataloader):
+            # dist.barrier()
             # Run evaluation at regular intervals
+            # logging.info(f"starting batch {batch_idx}")
             if batch_idx % eval_interval == 0:
+                # logging.info(f"[Rank {rank}] Running evaluation at {batch_idx / total_batches * 100:.1f}% of epoch {epoch + 1}")
                 model.eval()
                 if rank == 0:
                     print(f"\n[Evaluation] Running at {(batch_idx + 1) / total_batches * 100:.1f}% of epoch {epoch + 1}")
-                
-                # Ensure all processes are synchronized before evaluation
-                dist.barrier()
                 
                 # Run evaluation
                 eval_score = evaluate_model(model, rank, world_size, use_fp16=USE_FP16)
@@ -584,9 +570,6 @@ def train_worker(args):
                         "tm_score": eval_score
                     })
                     print(f"[Evaluation] TM Score: {eval_score:.4f}")
-                
-                # Ensure all processes are synchronized after evaluation
-                dist.barrier()
                 
                 # Return to train mode
                 model.train()
@@ -627,11 +610,11 @@ def train_worker(args):
                 # Scale the loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
             
-            logging.info(f"finished forward pass")
+            # logging.info(f"finished forward pass")
 
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
-            logging.info(f"finished backward pass")
+            # logging.info(f"finished backward pass")
             
             # Step if we've accumulated enough gradients
             if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
@@ -642,7 +625,7 @@ def train_worker(args):
                 scaler.update()
                 optimizer.zero_grad()
             
-            logging.info(f"finished step")
+            # logging.info(f"finished step")
             # Track loss
             epoch_loss += loss.item() * GRAD_ACCUM_STEPS
             processed_batches += 1
@@ -669,6 +652,8 @@ def train_worker(args):
                 warmup_scheduler.step()
                 if rank == 0 and global_step % 10 == 0:
                     print(f"Warmup step {global_step}/{WARMUP_STEPS}, LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+            # logging.info(f"finished batch {batch_idx}")
         
         # Close progress bar on main process
         if rank == 0:
