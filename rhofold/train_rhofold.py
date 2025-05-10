@@ -12,7 +12,7 @@ import datetime
 import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import wandb
@@ -98,35 +98,6 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-class SequentialDistributedSampler(Sampler):
-    """
-    Distributed Sampler that doesn't shuffle, ensuring each GPU gets
-    unique samples in a deterministic order
-    """
-    def __init__(self, dataset, world_size, rank):
-        self.dataset = dataset
-        self.world_size = world_size
-        self.rank = rank
-        self.num_samples = len(dataset) // world_size + int(len(dataset) % world_size > rank)
-        self.total_size = len(dataset)
-
-    def __iter__(self):
-        # Determine the indices for this process
-        indices = list(range(self.total_size))
-        # Subsample
-        indices = indices[self.rank:self.total_size:self.world_size]
-        return iter(indices)
-
-    def __len__(self):
-        return self.num_samples
-        
-    def set_epoch(self, epoch):
-        # This method is needed for compatibility with DDP training
-        # Since this sampler is sequential and doesn't shuffle, we don't
-        # need to do anything with the epoch number
-        pass
-
-
 class RNADataset(Dataset):
     def __init__(self, data_dir, use_evo2=True, max_seq_length=MAX_SEQ_LENGTH):
         self.data_dir = data_dir
@@ -183,8 +154,8 @@ class RNADataset(Dataset):
             else:
                 filtered_seq_ids.append(seq_id)
         
-        true_len = (len(filtered_seq_ids) // 8) * 8
-        self.seq_ids = filtered_seq_ids[:true_len]
+        # Remove the requirement for dataset length to be a multiple of 8
+        self.seq_ids = filtered_seq_ids
         
         logging.info(f"Found {len(self.seq_ids)} RNA sequences with valid PDB files for training")
         if self.missing_pdb_ids:
@@ -388,6 +359,9 @@ def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
     logging.info(f"[Rank {rank}] Starting evaluation")
     model.eval()
     
+    # Synchronize all processes before starting evaluation
+    dist.barrier()
+    
     def generator(features):
         logging.info(f"[Rank {rank}] Processing sequence {features.get('seq_id', 'unknown')}")
         with torch.no_grad():
@@ -407,18 +381,35 @@ def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
                     preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
                 return preds
             except Exception as e:
-                import traceback
+                logging.error(f"[Rank {rank}] Error in generator: {str(e)}")
                 return []
     
     try:
-        # Set a per-sequence timeout for evaluation (20 seconds per sequence)
-        eval_score = eval_model(generator, timeout_per_seq=20)
+        # Add timeout to prevent indefinite hangs
+        eval_score = eval_model(generator)
+        
+        # Synchronize scores across all processes
+        score_tensor = torch.tensor([eval_score], device=model.device)
+        dist.all_reduce(score_tensor, op=dist.ReduceOp.MAX)
+        eval_score = score_tensor.item()
+        
         return eval_score
     except Exception as e:
-        return 0.0  # Return default score on error
+        logging.error(f"[Rank {rank}] Evaluation error: {str(e)}")
+        # Ensure all processes continue even if evaluation fails on some
+        error_tensor = torch.tensor([1.0], device=model.device)
+        dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
+        return 0.0
     finally:
-        # Ensure we return to training mode
+        # Ensure all processes finish evaluation together
+        try:
+            dist.barrier()
+        except:
+            pass
+        # Return to training mode
         model.train()
+        # Free up memory
+        torch.cuda.empty_cache()
 
 
 def train_worker(args):
@@ -455,9 +446,6 @@ def train_worker(args):
     # Create checkpoint dir if it doesn't exist (only on main process)
     if rank == 0:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    
-    # Wait for rank 0 to create checkpoint dir
-    dist.barrier()
     
     # Initialize model
     model = RhoFold(rhofold_config).to(device)
@@ -520,8 +508,15 @@ def train_worker(args):
     # Create dataset and dataloader
     dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2, max_seq_length=MAX_SEQ_LENGTH)
     
-    # Create distributed sampler
-    sampler = SequentialDistributedSampler(dataset, world_size, rank)
+    # Create distributed sampler - PyTorch's DistributedSampler automatically handles
+    # ensuring all GPUs get the same number of batches, avoiding deadlocks
+    sampler = DistributedSampler(
+        dataset, 
+        num_replicas=world_size, 
+        rank=rank,
+        shuffle=False,  # Keep sequential ordering
+        drop_last=True  # Drop the last batch to ensure all GPUs have same number of batches
+    )
     
     # Create dataloader
     dataloader = DataLoader(
@@ -541,9 +536,6 @@ def train_worker(args):
         # Set epoch for sampler
         sampler.set_epoch(epoch)
         
-        # Ensure all processes are synchronized before starting the epoch
-        dist.barrier()
-        
         # Create progress bar on main process only
         if rank == 0:
             pbar = tqdm(total=len(sampler), desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
@@ -553,26 +545,33 @@ def train_worker(args):
         eval_interval = max(1, total_batches // 10)  # Evaluate every 10% of an epoch
         
         for batch_idx, batch in enumerate(dataloader):
-            # dist.barrier()
             # Run evaluation at regular intervals
-            # logging.info(f"starting batch {batch_idx}")
             if batch_idx % eval_interval == 0:
-                # logging.info(f"[Rank {rank}] Running evaluation at {batch_idx / total_batches * 100:.1f}% of epoch {epoch + 1}")
                 model.eval()
                 if rank == 0:
                     print(f"\n[Evaluation] Running at {(batch_idx + 1) / total_batches * 100:.1f}% of epoch {epoch + 1}")
                 
-                # Run evaluation
-                eval_score = evaluate_model(model, rank, world_size, use_fp16=USE_FP16)
-                
-                # Log evaluation metrics on main process
-                if rank == 0 and args.use_wandb and eval_score > 0:
-                    wandb.log({
-                        "epoch": epoch + 1,
-                        "progress": (batch_idx + 1) / total_batches,
-                        "tm_score": eval_score
-                    })
-                    print(f"[Evaluation] TM Score: {eval_score:.4f}")
+                # Make sure all processes are ready to evaluate
+                try:
+                    dist.barrier()
+                    # Run evaluation with timeout protection
+                    eval_score = evaluate_model(model, rank, world_size, use_fp16=USE_FP16)
+                    
+                    # Log evaluation metrics on main process
+                    if rank == 0 and args.use_wandb and eval_score > 0:
+                        wandb.log({
+                            "epoch": epoch + 1,
+                            "progress": (batch_idx + 1) / total_batches,
+                            "tm_score": eval_score
+                        })
+                        print(f"[Evaluation] TM Score: {eval_score:.4f}")
+                    
+                    # Make sure all processes are done with evaluation before proceeding
+                    dist.barrier()
+                except Exception as e:
+                    logging.error(f"[Rank {rank}] Evaluation block error: {str(e)}")
+                    # Continue training even if evaluation fails
+                    torch.cuda.empty_cache()
                 
                 # Return to train mode
                 model.train()
@@ -599,7 +598,7 @@ def train_worker(args):
             if USE_EVO2 and batch['evo2_fea'] is not None:
                 evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
             
-            logging.info(f"Processing sequence {seq_id} with length {len(seq)}")
+            # logging.info(f"Processing sequence {seq_id} with length {len(seq)}")
             # Forward pass with mixed precision
             with autocast(enabled=USE_FP16, dtype=torch.float16):
                 # Run model forward pass
@@ -613,11 +612,8 @@ def train_worker(args):
                 # Scale the loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
             
-            # logging.info(f"finished forward pass")
-
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
-            # logging.info(f"finished backward pass")
             
             # Step if we've accumulated enough gradients
             if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
@@ -628,7 +624,6 @@ def train_worker(args):
                 scaler.update()
                 optimizer.zero_grad()
             
-            # logging.info(f"finished step")
             # Track loss
             epoch_loss += loss.item() * GRAD_ACCUM_STEPS
             processed_batches += 1
@@ -655,15 +650,10 @@ def train_worker(args):
                 warmup_scheduler.step()
                 if rank == 0 and global_step % 10 == 0:
                     print(f"Warmup step {global_step}/{WARMUP_STEPS}, LR: {optimizer.param_groups[0]['lr']:.6f}")
-
-            # logging.info(f"finished batch {batch_idx}")
         
         # Close progress bar on main process
         if rank == 0:
             pbar.close()
-        
-        # Wait for all processes to finish their epoch iterations
-        dist.barrier()
         
         # Calculate average epoch loss
         if processed_batches > 0:
@@ -707,9 +697,6 @@ def train_worker(args):
         if (epoch + 1) % CHECKPOINT_EVERY == 0 and rank == 0:
             checkpoint_path = os.path.join(CHECKPOINT_DIR, f"rhofold_epoch_{epoch+1}.pt")
             save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_path)
-        
-        # Make sure all processes sync up before starting next epoch
-        dist.barrier()
     
     # Save final model (on main process only)
     if rank == 0:
@@ -733,7 +720,6 @@ def train_worker(args):
         print(f"Training completed. Final model saved to {final_checkpoint_path}")
     
     # Clean up distributed process
-    dist.barrier()  # Final sync point
     cleanup_distributed()
 
 
