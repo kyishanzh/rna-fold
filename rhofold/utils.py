@@ -165,7 +165,6 @@ def kabsch_align(P, Q):
 #     score = (1 / (1 + (dist / d0) ** 2)).mean()
 #     return score.item()
 
-@torch.no_grad()
 def tm_score(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """
     Compute classic TM-score between two [L,3] tensors.
@@ -234,8 +233,9 @@ def eval_model(generator):
         sample = generator(features)
         max_score = 0.0
         for v in sample:
-            score = tm_score(v, id_to_loc[idx].to(v.device))
-            max_score = max(max_score, score)
+            with torch.no_grad():
+                score = tm_score(v, id_to_loc[idx].to(v.device))
+                max_score = max(max_score, score)
         score_list.append(max_score)
 
     local_sum = torch.tensor(sum(score_list), dtype=torch.float32, device="cuda")

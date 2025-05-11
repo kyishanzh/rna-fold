@@ -32,7 +32,7 @@ from openfold.utils.rigid_utils import Rigid, Rotation
 from openfold.utils.loss import compute_fape
 
 # Import evaluation utilities
-from utils import eval_model, tm_score as calculate_tm_score
+from utils import eval_model, tm_score
 
 # Import distributed utilities to ensure compatibility with eval_model
 from distributed_utils import get_world_size, get_rank, is_main_process
@@ -204,8 +204,26 @@ class RNADataset(Dataset):
             'pdb_path': pdb_path
         }
 
+def compute_tm_loss(output, pdb_path):
+    pred_c1_positions = output["cords_c1'"][-1].squeeze(0)  # Shape [N, 3]
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("gt", pdb_path)
+    chain = next(structure.get_chains())
+    
+    # Extract C1' atoms from the PDB structure
+    gt_c1_positions = []
+    for res in chain:
+        try:
+            gt_c1_positions.append(res["C1'"].get_coord())
+        except:
+            gt_c1_positions.append([0, 0, 0])
+    gt_c1_positions = torch.tensor(np.array(gt_c1_positions), dtype=torch.float32, device=pred_c1_positions.device)
+    n_residues = min(pred_c1_positions.shape[0], gt_c1_positions.shape[0])
+    pred_c1_positions = pred_c1_positions[:n_residues]
+    gt_c1_positions = gt_c1_positions[:n_residues]
+    return tm_score(pred_c1_positions, gt_c1_positions)
 
-def compute_fape_loss(output, pdb_path, chain_id=None, length_scale=10.0, l1_clamp_distance=None):
+def compute_fape_loss(output, pdb_path, length_scale=10.0, l1_clamp_distance=None):
     """
     Compute FAPE loss between model output and ground truth PDB
     
@@ -243,10 +261,7 @@ def compute_fape_loss(output, pdb_path, chain_id=None, length_scale=10.0, l1_cla
     # Parse the PDB to get ground truth C1' positions
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("gt", pdb_path)
-    if chain_id is None:
-        chain = next(structure.get_chains())
-    else:
-        chain = structure[0][chain_id]
+    chain = next(structure.get_chains())
     
     # Extract C1' atoms from the PDB structure
     gt_c1_positions = []
@@ -527,6 +542,8 @@ def train_worker(args):
     global_step = 0
     for epoch in range(start_epoch, NUM_EPOCHS):
         epoch_loss = 0
+        epoch_fape_loss = 0
+        epoch_tm_score = 0
         optimizer.zero_grad()
         
         # Set epoch for sampler
@@ -601,7 +618,17 @@ def train_worker(args):
             output = outputs[-1]
             
             # Compute FAPE loss
-            loss = compute_fape_loss(output, pdb_path)
+            fape_loss = compute_fape_loss(output, pdb_path)
+            
+            # Calculate TM score for the current prediction
+            # Extract the predicted coordinates for TM score calculation
+            pred_coords = output["cords_c1'"][-1].squeeze(0).cpu().detach().numpy()
+            # Calculate TM score between prediction and ground truth
+            tm_score = compute_tm_loss(output, pdb_path)
+            
+            # Combined loss: FAPE - 20 * TM score
+            loss = fape_loss - 20.0 * tm_score
+            
             # Scale the loss for gradient accumulation
             loss = loss / GRAD_ACCUM_STEPS
             
@@ -609,7 +636,7 @@ def train_worker(args):
             loss.backward()
             
             # Print parameters with no gradients (rank 0 only)
-            if False:
+            if True:
                 if rank == 0 and (batch_idx == 0 or batch_idx % 20 == 0):  # Only print occasionally to avoid spam
                     params_with_no_grad = []
                     params_with_grad = []
@@ -635,12 +662,17 @@ def train_worker(args):
             
             # Track loss
             epoch_loss += loss.item() * GRAD_ACCUM_STEPS
+            epoch_fape_loss += fape_loss.item() * GRAD_ACCUM_STEPS
+            epoch_tm_score += tm_score * GRAD_ACCUM_STEPS
             processed_batches += 1
             
             # Log batch metrics on main process
             if rank == 0 and args.use_wandb:
                 wandb.log({
                     "batch_loss": loss.item() * GRAD_ACCUM_STEPS,
+                    "fape_loss": fape_loss.item(),
+                    "tm_score": tm_score,
+                    "tm_score_weighted": 20.0 * tm_score,
                     "pLDDT": output["plddt"][1].item() if "plddt" in output else 0.0,
                     "seq_id": seq_id,
                     "seq_length": len(seq),
@@ -667,13 +699,27 @@ def train_worker(args):
         # Calculate average epoch loss
         if processed_batches > 0:
             avg_loss = epoch_loss / processed_batches
+            avg_fape_loss = epoch_fape_loss / processed_batches
+            avg_tm_score = epoch_tm_score / processed_batches
         else:
             avg_loss = 0
+            avg_fape_loss = 0
+            avg_tm_score = 0
             
         # Average loss across all processes
         avg_loss_tensor = torch.tensor([avg_loss], device=device)
         dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
         avg_loss = avg_loss_tensor.item() / world_size
+        
+        # Average FAPE loss across all processes
+        avg_fape_loss_tensor = torch.tensor([avg_fape_loss], device=device)
+        dist.all_reduce(avg_fape_loss_tensor, op=dist.ReduceOp.SUM)
+        avg_fape_loss = avg_fape_loss_tensor.item() / world_size
+        
+        # Average TM score across all processes
+        avg_tm_score_tensor = torch.tensor([avg_tm_score], device=device)
+        dist.all_reduce(avg_tm_score_tensor, op=dist.ReduceOp.SUM)
+        avg_tm_score = avg_tm_score_tensor.item() / world_size
         
         # Get total processed batches from all GPUs
         processed_tensor = torch.tensor([processed_batches], device=device)
@@ -682,11 +728,13 @@ def train_worker(args):
         
         # Log epoch metrics on main process
         if rank == 0:
-            print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f} - Processed {total_processed} sequences")
+            print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f} - FAPE Loss: {avg_fape_loss:.4f} - TM Score: {avg_tm_score:.4f} - Processed {total_processed} sequences")
             if args.use_wandb:
                 wandb.log({
                     "epoch": epoch + 1,
                     "train_loss": avg_loss,
+                    "train_fape_loss": avg_fape_loss,
+                    "train_tm_score": avg_tm_score,
                     "learning_rate": optimizer.param_groups[0]['lr'],
                     "processed_sequences": total_processed
                 })
