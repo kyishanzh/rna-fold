@@ -42,9 +42,11 @@ CHECKPOINT_DIR = "checkpoints"
 USE_EVO2 = True
 BATCH_SIZE = 1  # Keep batch size at 1 for each GPU
 NUM_EPOCHS = 20
-LEARNING_RATE = 2e-4
-CHECKPOINT_EVERY = 2
-WARMUP_STEPS = 100
+LEARNING_RATE = 1e-5
+EVO2_LR = 2e-4  # Higher learning rate for evo2_head
+EVAL_PER_EPOCH = 4  # Number of evaluations per epoch
+CHECKPOINT_EVERY = 1
+WARMUP_STEPS = 1000
 SKIP_SHORT_SEQS = True  # If True, skip sequences with length > MAX_SEQ_LENGTH
 GRAD_ACCUM_STEPS = 4   # Number of steps to accumulate gradients
 MAX_SEQ_LENGTH = 200    # Maximum sequence length to process to avoid OOM errors
@@ -54,6 +56,11 @@ DROPOUT_RATE = 0.1     # Dropout rate for regularization
 # Set to your specific project/entity here or use environment variables
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rhofold")
 
+def get_evo2head_norm(model):
+    evo2_head = model.module.evo2_head
+    param_count = sum(p.numel() for p in evo2_head.parameters())
+    param_sum = sum((p**2).sum() for p in evo2_head.parameters())
+    return param_sum / param_count
 def setup_distributed():
     """
     Setup distributed training environment for torchrun
@@ -151,6 +158,9 @@ class RNADataset(Dataset):
                     self.skipped_long_seqs.append(seq_id)
             else:
                 filtered_seq_ids.append(seq_id)
+        
+        tru_len = (len(filtered_seq_ids) // 8) * 8
+        filtered_seq_ids = filtered_seq_ids[:tru_len]
         
         # Remove the requirement for dataset length to be a multiple of 8
         self.seq_ids = filtered_seq_ids
@@ -312,7 +322,6 @@ def compute_fape_loss(output, pdb_path, length_scale=10.0, l1_clamp_distance=Non
     
     return fape
 
-
 def load_checkpoint(model, checkpoint_path, rank):
     """
     Load model checkpoint with proper handling for DDP
@@ -367,16 +376,13 @@ def save_checkpoint(model, optimizer, epoch, loss, path):
     }, path)
     logging.info(f"Checkpoint saved to {path}")
 
-
 def evaluate_model(model, rank, world_size):
     logging.info(f"[Rank {rank}] Starting evaluation")
     model.eval()
     
-    # Synchronize all processes before starting evaluation
-    dist.barrier()
+    # No barrier here - we'll handle synchronization in the calling function
     
     def generator(features):
-        # logging.info(f"[Rank {rank}] Processing sequence {features.get('seq_id', 'unknown')}")
         # Use torch.no_grad() during evaluation
         with torch.no_grad():
             try:
@@ -415,11 +421,7 @@ def evaluate_model(model, rank, world_size):
         dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
         return 0.0
     finally:
-        # Ensure all processes finish evaluation together
-        try:
-            dist.barrier()
-        except:
-            pass
+        # No barrier here - we'll handle synchronization in the calling function
         # Return to training mode
         model.train()
         # Free up memory
@@ -492,8 +494,23 @@ def train_worker(args):
         param_count = sum(p.numel() for p in model.parameters())
         print(f"Model initialized with {param_count:,} parameters")
     
-    # Initialize optimizer with weight decay
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # Initialize optimizer with parameter groups
+    # Group 1: evo2_head parameters with higher learning rate
+    # Group 2: All other parameters with default learning rate
+    evo2_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if 'evo2_head' in name:
+            evo2_params.append(param)
+        else:
+            other_params.append(param)
+    
+    param_groups = [
+        {'params': evo2_params, 'lr': EVO2_LR},
+        # {'params': other_params, 'lr': LEARNING_RATE}
+    ]
+    
+    optimizer = torch.optim.Adam(param_groups, weight_decay=WEIGHT_DECAY)
     
     # Create warmup scheduler
     def get_warmup_lr_lambda(current_step):
@@ -549,13 +566,16 @@ def train_worker(args):
         # Set epoch for sampler
         sampler.set_epoch(epoch)
         
+        # Synchronize at the beginning of each epoch
+        dist.barrier()
+        
         # Create progress bar on main process only
         if rank == 0:
             pbar = tqdm(total=len(sampler), desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
         
         processed_batches = 0
         total_batches = len(dataloader)
-        eval_interval = max(1, total_batches // 4)  # Evaluate every 25% of an epoch
+        eval_interval = max(1, total_batches // EVAL_PER_EPOCH)  # Evaluate every 1/EVAL_PER_EPOCH of an epoch
         
         for batch_idx, batch in enumerate(dataloader):
             # Run evaluation at regular intervals
@@ -566,8 +586,10 @@ def train_worker(args):
                 
                 # Make sure all processes are ready to evaluate
                 try:
+                    # Single barrier before evaluation
                     dist.barrier()
-                    # Run evaluation with timeout protection
+                    
+                    # Run evaluation
                     eval_score = evaluate_model(model, rank, world_size)
                     
                     # Log evaluation metrics on main process
@@ -583,8 +605,11 @@ def train_worker(args):
                     dist.barrier()
                 except Exception as e:
                     logging.error(f"[Rank {rank}] Evaluation block error: {str(e)}")
-                    # Continue training even if evaluation fails
-                    torch.cuda.empty_cache()
+                    # Try to synchronize processes even if evaluation fails
+                    try:
+                        dist.barrier()
+                    except:
+                        logging.error(f"[Rank {rank}] Failed to synchronize after evaluation error")
                 
                 # Return to train mode
                 model.train()
@@ -636,7 +661,7 @@ def train_worker(args):
             loss.backward()
             
             # Print parameters with no gradients (rank 0 only)
-            if True:
+            if False:
                 if rank == 0 and (batch_idx == 0 or batch_idx % 20 == 0):  # Only print occasionally to avoid spam
                     params_with_no_grad = []
                     params_with_grad = []
@@ -661,15 +686,16 @@ def train_worker(args):
                 optimizer.zero_grad()
             
             # Track loss
-            epoch_loss += loss.item() * GRAD_ACCUM_STEPS
-            epoch_fape_loss += fape_loss.item() * GRAD_ACCUM_STEPS
-            epoch_tm_score += tm_score * GRAD_ACCUM_STEPS
+            epoch_loss += loss.item()
+            epoch_fape_loss += fape_loss.item()
+            epoch_tm_score += tm_score
             processed_batches += 1
             
             # Log batch metrics on main process
             if rank == 0 and args.use_wandb:
+                evo2head_norm = get_evo2head_norm(model)
                 wandb.log({
-                    "batch_loss": loss.item() * GRAD_ACCUM_STEPS,
+                    "batch_loss": loss.item(),
                     "fape_loss": fape_loss.item(),
                     "tm_score": tm_score,
                     "tm_score_weighted": 20.0 * tm_score,
@@ -677,6 +703,10 @@ def train_worker(args):
                     "seq_id": seq_id,
                     "seq_length": len(seq),
                     "memory_usage_MB": torch.cuda.memory_allocated(device) / 1024**2,
+                    "evo2head_norm": evo2head_norm,
+                    "epoch_avg_loss": epoch_loss / processed_batches,
+                    "epoch_avg_fape_loss": epoch_fape_loss / processed_batches,
+                    "epoch_avg_tm_score": epoch_tm_score / processed_batches,
                 })
             
             # Update progress bar on main process
@@ -689,8 +719,6 @@ def train_worker(args):
             # Apply warmup scheduler if still in warmup phase
             if global_step <= WARMUP_STEPS:
                 warmup_scheduler.step()
-                if rank == 0 and global_step % 10 == 0:
-                    print(f"Warmup step {global_step}/{WARMUP_STEPS}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Close progress bar on main process
         if rank == 0:
@@ -706,6 +734,7 @@ def train_worker(args):
             avg_fape_loss = 0
             avg_tm_score = 0
             
+        logging.info(f"Rank {rank} - epoch {epoch+1} completed")
         # Average loss across all processes
         avg_loss_tensor = torch.tensor([avg_loss], device=device)
         dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
@@ -739,21 +768,12 @@ def train_worker(args):
                     "processed_sequences": total_processed
                 })
         
-        # Update learning rate scheduler (on main process only - after warmup)
-        if rank == 0 and global_step > WARMUP_STEPS:
-            scheduler.step()
-            
-            # Broadcast new learning rate to all processes
-            for i, param_group in enumerate(optimizer.param_groups):
-                lr = torch.tensor([param_group['lr']], device=device)
-                dist.broadcast(lr, src=0)
-                if rank != 0:
-                    param_group['lr'] = lr.item()
-        
+        logging.info(f"Rank {rank} - epoch {epoch+1} logging completed")
         # Save checkpoint (on main process only)
         if (epoch + 1) % CHECKPOINT_EVERY == 0 and rank == 0:
             checkpoint_path = os.path.join(CHECKPOINT_DIR, f"rhofold_epoch_{epoch+1}.pt")
             save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_path)
+        logging.info(f"Rank {rank} - epoch {epoch+1} checkpoint saved")
     
     # Save final model (on main process only)
     if rank == 0:
@@ -837,7 +857,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train RhoFold with FAPE loss")
     parser.add_argument("--data_dir", type=str, default="/dev/shm", 
                         help="Directory containing RNA data")
-    parser.add_argument("--checkpoint", type=str, default=None, 
+    parser.add_argument("--checkpoint", type=str, default="./pretrained/RhoFold_pretrained.pt", 
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--use_wandb", action="store_true", default=False,
                         help="Whether to use Weights & Biases for logging")
