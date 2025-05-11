@@ -18,7 +18,6 @@ import torch.distributed as dist
 import wandb
 import numpy as np
 from Bio.PDB import PDBParser
-from torch.cuda.amp import autocast, GradScaler
 
 # Add openfold to path
 openfold_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "openfold"))
@@ -48,8 +47,7 @@ CHECKPOINT_EVERY = 2
 WARMUP_STEPS = 100
 SKIP_SHORT_SEQS = True  # If True, skip sequences with length > MAX_SEQ_LENGTH
 GRAD_ACCUM_STEPS = 4   # Number of steps to accumulate gradients
-MAX_SEQ_LENGTH = 250    # Maximum sequence length to process to avoid OOM errors
-USE_FP16 = True        # Enable FP16 (half-precision) training
+MAX_SEQ_LENGTH = 200    # Maximum sequence length to process to avoid OOM errors
 WEIGHT_DECAY = 0.01    # Weight decay for regularization 
 DROPOUT_RATE = 0.1     # Dropout rate for regularization
 
@@ -355,7 +353,7 @@ def save_checkpoint(model, optimizer, epoch, loss, path):
     logging.info(f"Checkpoint saved to {path}")
 
 
-def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
+def evaluate_model(model, rank, world_size):
     logging.info(f"[Rank {rank}] Starting evaluation")
     model.eval()
     
@@ -363,7 +361,8 @@ def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
     dist.barrier()
     
     def generator(features):
-        logging.info(f"[Rank {rank}] Processing sequence {features.get('seq_id', 'unknown')}")
+        # logging.info(f"[Rank {rank}] Processing sequence {features.get('seq_id', 'unknown')}")
+        # Use torch.no_grad() during evaluation
         with torch.no_grad():
             try:
                 if "evo2_fea" in features:
@@ -381,7 +380,7 @@ def evaluate_model(model, rank, world_size, use_fp16=USE_FP16):
                     preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
                 return preds
             except Exception as e:
-                logging.error(f"[Rank {rank}] Error in generator: {str(e)}")
+                logging.error(f"[Rank {rank}] Error in generator: {str(e)} on sequence {features.get('seq_id', 'unknown')}")
                 return []
     
     try:
@@ -435,7 +434,7 @@ def train_worker(args):
                 "batch_size": BATCH_SIZE,
                 "use_evo2": USE_EVO2,
                 "skip_short_seqs": SKIP_SHORT_SEQS,
-                "precision": "fp16" if USE_FP16 else "fp32",
+                "precision": "fp32",
                 "grad_accum_steps": GRAD_ACCUM_STEPS,
                 "max_seq_length": MAX_SEQ_LENGTH,
                 "world_size": world_size,
@@ -477,9 +476,6 @@ def train_worker(args):
     if rank == 0:
         param_count = sum(p.numel() for p in model.parameters())
         print(f"Model initialized with {param_count:,} parameters")
-    
-    # Initialize gradient scaler for mixed precision training
-    scaler = GradScaler(enabled=USE_FP16)
     
     # Initialize optimizer with weight decay
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -542,7 +538,7 @@ def train_worker(args):
         
         processed_batches = 0
         total_batches = len(dataloader)
-        eval_interval = max(1, total_batches // 10)  # Evaluate every 10% of an epoch
+        eval_interval = max(1, total_batches // 4)  # Evaluate every 25% of an epoch
         
         for batch_idx, batch in enumerate(dataloader):
             # Run evaluation at regular intervals
@@ -555,7 +551,7 @@ def train_worker(args):
                 try:
                     dist.barrier()
                     # Run evaluation with timeout protection
-                    eval_score = evaluate_model(model, rank, world_size, use_fp16=USE_FP16)
+                    eval_score = evaluate_model(model, rank, world_size)
                     
                     # Log evaluation metrics on main process
                     if rank == 0 and args.use_wandb and eval_score > 0:
@@ -598,30 +594,43 @@ def train_worker(args):
             if USE_EVO2 and batch['evo2_fea'] is not None:
                 evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
             
-            # logging.info(f"Processing sequence {seq_id} with length {len(seq)}")
-            # Forward pass with mixed precision
-            with autocast(enabled=USE_FP16, dtype=torch.float16):
-                # Run model forward pass
-                outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
-                
-                # Take the last output from recycles
-                output = outputs[-1]
-                
-                # Compute FAPE loss
-                loss = compute_fape_loss(output, pdb_path)
-                # Scale the loss for gradient accumulation
-                loss = loss / GRAD_ACCUM_STEPS
+            # Run model forward pass
+            outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
             
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
+            # Take the last output from recycles
+            output = outputs[-1]
+            
+            # Compute FAPE loss
+            loss = compute_fape_loss(output, pdb_path)
+            # Scale the loss for gradient accumulation
+            loss = loss / GRAD_ACCUM_STEPS
+            
+            # Backward pass
+            loss.backward()
+            
+            # Print parameters with no gradients (rank 0 only)
+            if False:
+                if rank == 0 and (batch_idx == 0 or batch_idx % 20 == 0):  # Only print occasionally to avoid spam
+                    params_with_no_grad = []
+                    params_with_grad = []
+                    for i, (name, param) in enumerate(model.named_parameters()):
+                        if param.grad is None:
+                            params_with_no_grad.append((i, name))
+                        else:
+                            params_with_grad.append((i, name))
+
+                    
+                    if params_with_no_grad:
+                        print(f"\n[Rank 0] Parameters with no gradients after backward pass (batch {batch_idx}):")
+                        for idx, name in params_with_no_grad:
+                            print(f"  [{idx}] {name}")
+                        print(f"Total: {len(params_with_no_grad)} parameters with no gradients")
             
             # Step if we've accumulated enough gradients
             if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
-                # Unscale before gradient clipping
-                scaler.unscale_(optimizer)
+                # Clip gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
             
             # Track loss

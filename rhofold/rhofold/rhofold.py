@@ -100,7 +100,7 @@ class RhoFold(nn.Module):
 
         return output
 
-    def forward_one_cycle(self, tokens, rna_fm_tokens, recycling_inputs, seq, evo2_fea=None, train=False):
+    def forward_one_cycle(self, tokens, rna_fm_tokens, recycling_inputs, seq, evo2_fea=None):
         '''
         Args:
             tokens: [bs, seq_len, c_z]
@@ -161,12 +161,13 @@ class RhoFold(nn.Module):
         recycling_inputs = None
 
         if kwargs.get("train", False):
-            cycles = random.randint(1, self.config.model.recycling_embedder.recycles)
+            cycles = random.randint(2, self.config.model.recycling_embedder.recycles)
+            evo2_fea = kwargs.get("evo2_fea", None)
             for _r in range(cycles-1):
                 with torch.no_grad():
                     _, recycling_inputs = \
-                        self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq, **kwargs)
-            output, _ = self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq, **kwargs)
+                        self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq, evo2_fea)
+            output, _ = self.forward_one_cycle(tokens, rna_fm_tokens, recycling_inputs, seq, evo2_fea)
             return [output]
 
         outputs = []
