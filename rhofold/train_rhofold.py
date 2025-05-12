@@ -32,7 +32,7 @@ from openfold.utils.rigid_utils import Rigid, Rotation
 from openfold.utils.loss import compute_fape
 
 # Import evaluation utilities
-from utils import eval_model, tm_score
+from utils import eval_model, tm_score, all_seq_ids
 
 # Import distributed utilities to ensure compatibility with eval_model
 from distributed_utils import get_world_size, get_rank, is_main_process
@@ -44,7 +44,7 @@ BATCH_SIZE = 1  # Keep batch size at 1 for each GPU
 NUM_EPOCHS = 20
 LEARNING_RATE = 2e-7
 EVO2_LR = 1e-4  # Higher learning rate for evo2_head
-EVAL_PER_EPOCH = 4  # Number of evaluations per epoch
+EVAL_PER_EPOCH = 10  # Number of evaluations per epoch
 CHECKPOINT_EVERY = 1
 WARMUP_STEPS = 1000
 SKIP_SHORT_SEQS = True  # If True, skip sequences with length > MAX_SEQ_LENGTH
@@ -55,6 +55,8 @@ DROPOUT_RATE = 0.1     # Dropout rate for regularization
 
 # Set to your specific project/entity here or use environment variables
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rhofold")
+
+USE_RHOFOLD_DATA = True
 
 def get_evo2head_norm(model):
     evo2_head = model.module.evo2_head
@@ -108,6 +110,10 @@ class RNADataset(Dataset):
         self.data_dir = data_dir
         self.use_evo2 = use_evo2
         self.max_seq_length = max_seq_length
+
+        if not USE_RHOFOLD_DATA:
+            self.seq_ids = all_seq_ids()
+            return
         
         # Get sequence IDs from the directory
         seq_dir = os.path.join(data_dir, "RNA3D_DATA/seq")
@@ -178,9 +184,14 @@ class RNADataset(Dataset):
         seq_id = self.seq_ids[idx]
         
         # Load sequence and MSA features
-        input_fas = os.path.join(self.data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
-        input_a3m = os.path.join(self.data_dir, f"RNA3D_DATA/rMSA/{seq_id}.a3m")
-        data_dict = get_features(input_fas, input_a3m)
+        if USE_RHOFOLD_DATA:
+            input_fas = os.path.join(self.data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
+            input_a3m = os.path.join(self.data_dir, f"RNA3D_DATA/rMSA/{seq_id}.a3m")
+            data_dict = get_features(input_fas, input_a3m)
+        else:
+            input_fas = os.path.join(self.data_dir, f"MSA/{seq_id}.fasta")
+            input_a3m = os.path.join(self.data_dir, f"MSA/{seq_id}.MSA.fasta")
+            data_dict = get_features(input_fas, input_a3m)
         
         # Check if tokens and rna_fm_tokens have the same last dimension
         if data_dict['tokens'].shape[-1] != data_dict['rna_fm_tokens'].shape[-1]:
@@ -194,7 +205,10 @@ class RNADataset(Dataset):
         # Load evo2 embedding if enabled
         evo2_embedding = None
         if self.use_evo2:
-            embeddings_dir = os.path.join(self.data_dir, "RNA3D_DATA/evo2_embeddings")
+            if USE_RHOFOLD_DATA:
+                embeddings_dir = os.path.join(self.data_dir, "RNA3D_DATA/evo2_embeddings")
+            else:
+                embeddings_dir = os.path.join(self.data_dir, "evo2_embeddings")
             embedding_path = os.path.join(embeddings_dir, f"{seq_id}.pt")
             evo2_embedding = torch.load(embedding_path)
         
@@ -600,7 +614,7 @@ def train_worker(args):
         dataset, 
         num_replicas=world_size, 
         rank=rank,
-        shuffle=False,  # Keep sequential ordering
+        shuffle=False,
         drop_last=True  # Drop the last batch to ensure all GPUs have same number of batches
     )
     
@@ -654,9 +668,7 @@ def train_worker(args):
                     # Log evaluation metrics on main process
                     if rank == 0 and args.use_wandb and eval_score > 0:
                         wandb.log({
-                            "epoch": epoch + 1,
-                            "progress": (batch_idx + 1) / total_batches,
-                            "tm_score": eval_score
+                            "eval_tm_score": eval_score
                         })
                         print(f"[Evaluation] TM Score: {eval_score:.4f}")
                     
@@ -707,7 +719,7 @@ def train_worker(args):
             dist_loss = compute_dist_loss(output, seq, pdb_path)
             
             # Combined loss: FAPE - 20 * TM score
-            loss = 2 * fape_loss - 500 * tm_score + 0.3 * dist_loss
+            loss = 2 * fape_loss - 200 * tm_score + 0.3 * dist_loss
             
             # Scale the loss for gradient accumulation
             loss = loss / GRAD_ACCUM_STEPS
@@ -734,11 +746,25 @@ def train_worker(args):
                         print(f"Total: {len(params_with_no_grad)} parameters with no gradients")
             
             # Step if we've accumulated enough gradients
+            nan_count = 0
             if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
                 # Clip gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Check for NaN gradients and replace with zeros
+                for param in model.parameters():
+                    if param.grad is not None:
+                        nan_mask = torch.isnan(param.grad)
+                        if nan_mask.any():
+                            nan_count += nan_mask.sum().item()
+                            param.grad[nan_mask] = 0.0
+                
                 optimizer.step()
                 optimizer.zero_grad()
+                if rank == 0:
+                    wandb.log({
+                        "nan_count": nan_count
+                    })
             
             # Track loss
             epoch_loss += loss.item()

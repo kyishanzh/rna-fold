@@ -102,7 +102,7 @@ def all_seq_ids(split="train"):  # train, val, test; return all the seq ids
     csv_path = split_to_csv(split)
     df = pd.read_csv(csv_path)
     idx_list = df["target_id"].tolist()
-    return [idx for idx in idx_list if len(id_to_seq[idx]) < 45]
+    return [idx for idx in idx_list if len(id_to_seq[idx]) < 200]
 
 
 def g_features(seq_id):
@@ -212,7 +212,7 @@ def tm_score(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         d0 = 0.6 * (L - 0.5) ** 0.5 - 2.5
 
     tm = torch.mean(1.0 / (1.0 + (dists / d0) ** 2))
-    return tm.item()
+    return tm
 
 
 import torch.distributed as dist
@@ -234,7 +234,7 @@ def eval_model(generator):
         max_score = 0.0
         for v in sample:
             with torch.no_grad():
-                score = tm_score(v, id_to_loc[idx].to(v.device))
+                score = tm_score(v, id_to_loc[idx].to(v.device)).item()
                 max_score = max(max_score, score)
         score_list.append(max_score)
 
