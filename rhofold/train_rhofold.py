@@ -5,15 +5,15 @@ import logging
 from tqdm import tqdm
 import time
 import random
-import socket
-import multiprocessing as mp
 import datetime
 
 import torch
 import torch.nn as nn
-import torch.multiprocessing as mp
-from torch.utils.data import Dataset, DataLoader, Sampler, DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader
+import pytorch_lightning as pl
+from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 import torch.distributed as dist
 import wandb
 import numpy as np
@@ -26,7 +26,6 @@ if openfold_path not in sys.path:
 
 from rhofold.rhofold import RhoFold
 from rhofold.config import rhofold_config
-from rhofold.utils import get_device
 from rhofold.utils.alphabet import get_features, read_fas
 from openfold.utils.rigid_utils import Rigid, Rotation
 from openfold.utils.loss import compute_fape
@@ -47,9 +46,9 @@ EVO2_LR = 1e-4  # Higher learning rate for evo2_head
 EVAL_PER_EPOCH = 10  # Number of evaluations per epoch
 CHECKPOINT_EVERY = 1
 WARMUP_STEPS = 1000
-SKIP_SHORT_SEQS = True  # If True, skip sequences with length > MAX_SEQ_LENGTH
+SKIP_SHORT_SEQS = True  # Skip sequences with length > MAX_SEQ_LENGTH
 GRAD_ACCUM_STEPS = 4   # Number of steps to accumulate gradients
-MAX_SEQ_LENGTH = 200    # Maximum sequence length to process to avoid OOM errors
+MAX_SEQ_LENGTH = 200    # Maximum sequence length to avoid OOM errors
 WEIGHT_DECAY = 0.01    # Weight decay for regularization 
 DROPOUT_RATE = 0.1     # Dropout rate for regularization
 
@@ -59,51 +58,15 @@ WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rhofold")
 USE_RHOFOLD_DATA = True
 
 def get_evo2head_norm(model):
-    evo2_head = model.module.evo2_head
+    """Get L2 norm of the evo2_head parameters"""
+    if isinstance(model, RhoFoldLightningModule):
+        evo2_head = model.model.evo2_head
+    else:
+        evo2_head = model.module.evo2_head
+    
     param_count = sum(p.numel() for p in evo2_head.parameters())
     param_sum = sum((p**2).sum() for p in evo2_head.parameters())
     return param_sum / param_count
-def setup_distributed():
-    """
-    Setup distributed training environment for torchrun
-    
-    Environment variables set by torchrun:
-    - RANK: Global rank of the process
-    - WORLD_SIZE: Total number of processes
-    - LOCAL_RANK: Local rank of the process on the current node
-    - MASTER_ADDR: Address of the master node
-    - MASTER_PORT: Port of the master node
-    """
-    # Get local rank and world size from environment variables (set by torchrun)
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    rank = int(os.environ.get("RANK", 0))
-    
-    # Enable NCCL debugging if needed (uncomment for debugging)
-    # os.environ['NCCL_DEBUG'] = 'INFO'
-    
-    # Initialize the process group using env vars set by torchrun
-    dist.init_process_group("nccl")
-    
-    # Set different seeds for different processes for proper randomization
-    torch.manual_seed(42 + rank)
-    np.random.seed(42 + rank)
-    random.seed(42 + rank)
-    
-    # Set device for this process
-    torch.cuda.set_device(local_rank)
-    
-    # Make sure all processes are synchronized before proceeding
-    dist.barrier()
-    
-    return local_rank, rank, world_size
-
-
-def cleanup_distributed():
-    """Clean up distributed training resources"""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
 
 def get_mask(tru_seq, pdb_seq):
     # Given true seq and seq of residues covered by pdb, find mask of true seq that can match to pdb
@@ -116,10 +79,8 @@ def get_mask(tru_seq, pdb_seq):
             mask[i] = True
     return mask
 
-
 def get_pdb_seq(structure):
     return "".join([res.get_resname() for res in structure.get_residues()])
-
 
 def extract_atom_positions_from_pdb(pdb_path, tru_seq):
     """
@@ -172,7 +133,6 @@ def extract_atom_positions_from_pdb(pdb_path, tru_seq):
         'pdb_seq': pdb_seq
     }
 
-
 class RNADataset(Dataset):
     def __init__(self, data_dir, use_evo2=True, max_seq_length=MAX_SEQ_LENGTH, preload_pdbs=True):
         self.data_dir = data_dir
@@ -191,7 +151,6 @@ class RNADataset(Dataset):
         
         # Get sequence IDs from the directory
         seq_dir = os.path.join(data_dir, "RNA3D_DATA/seq")
-        rMSA_dir = os.path.join(data_dir, "RNA3D_DATA/rMSA")
         
         # Filter sequence IDs to only include those with both seq and a3m files
         self.seq_ids = []
@@ -238,11 +197,8 @@ class RNADataset(Dataset):
                     self.skipped_long_seqs.append(seq_id)
             else:
                 filtered_seq_ids.append(seq_id)
+            if len(filtered_seq_ids) >= 100: break
         
-        tru_len = (len(filtered_seq_ids) // 8) * 8
-        filtered_seq_ids = filtered_seq_ids[:tru_len]
-        
-        # Remove the requirement for dataset length to be a multiple of 8
         self.seq_ids = filtered_seq_ids
         
         logging.info(f"Found {len(self.seq_ids)} RNA sequences with valid PDB files for training")
@@ -315,7 +271,7 @@ class RNADataset(Dataset):
         # Return cached data if available
         if self.preload_pdbs and seq_id in self.cached_features:
             data_dict = self.cached_features[seq_id]
-            evo2_embedding = self.cached_evo2_embeddings[seq_id]
+            evo2_embedding = self.cached_evo2_embeddings.get(seq_id, None)
             pdb_data = self.cached_pdb_data[seq_id]
             
             return {
@@ -378,7 +334,6 @@ class RNADataset(Dataset):
             'pdb_data': pdb_data,
         }
 
-
 def compute_tm_loss(output, pdb_data, device):
     """Compute TM score loss using preloaded PDB data"""
     pred_c1_positions = output["cords_c1'"][-1].squeeze(0)  # Shape [N, 3]
@@ -392,7 +347,6 @@ def compute_tm_loss(output, pdb_data, device):
     
     # Compute TM score
     return tm_score(pred_c1_positions, gt_c1_positions)
-
 
 def compute_fape_loss(output, pdb_data, device, length_scale=10.0, l1_clamp_distance=None):
     """Compute FAPE loss using preloaded PDB data"""
@@ -454,7 +408,6 @@ def compute_fape_loss(output, pdb_data, device, length_scale=10.0, l1_clamp_dist
     
     return fape
 
-
 def compute_dist_loss(output, pdb_data, device):
     """Compute distance loss using preloaded PDB data"""
     # Extract predicted distances
@@ -485,568 +438,543 @@ def compute_dist_loss(output, pdb_data, device):
     
     return loss
 
-
-def load_checkpoint(model, checkpoint_path, rank):
-    """
-    Load model checkpoint with proper handling for DDP
-    
-    Args:
-        model: DDP wrapped model
-        checkpoint_path: Path to checkpoint file
-        rank: Process rank
+# Custom Lightning DataModule for RNA data
+class RNADataModule(pl.LightningDataModule):
+    def __init__(self, data_dir, batch_size=1, use_evo2=True, max_seq_length=200, preload_pdbs=True, num_workers=4):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.use_evo2 = use_evo2
+        self.max_seq_length = max_seq_length
+        self.preload_pdbs = preload_pdbs
+        self.num_workers = num_workers
         
-    Returns:
-        Starting epoch number
-    """
-    # Load checkpoint using map_location to place tensors on the right device
-    map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
-    
-    # Handle module prefixes in state dict
-    if any(k.startswith('module.') for k in checkpoint['model']):
-        # Model was saved with DDP
-        model.load_state_dict(checkpoint['model'], strict=False)
-    else:
-        # Model was saved without DDP, add module prefix
-        from collections import OrderedDict
-        new_state_dict = OrderedDict()
-        for k, v in checkpoint['model'].items():
-            new_state_dict[f'module.{k}'] = v
-        model.load_state_dict(new_state_dict, strict=False)
+    def setup(self, stage=None):
+        # Create full dataset - we'll use the same for train and validation
+        self.dataset = RNADataset(
+            self.data_dir, 
+            use_evo2=self.use_evo2, 
+            max_seq_length=self.max_seq_length, 
+            preload_pdbs=self.preload_pdbs
+        )
         
-    start_epoch = checkpoint.get('epoch', 0)
-    if rank == 0:
-        print(f"Loaded checkpoint from {checkpoint_path}, starting from epoch {start_epoch}")
+        # Print dataset stats
+        print(f"Dataset loaded with {len(self.dataset)} sequences")
+        
+    def train_dataloader(self):
+        return DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True
+        )
     
-    return start_epoch
-
-
-def save_checkpoint(model, optimizer, epoch, loss, path):
-    """
-    Save model checkpoint
+    def val_dataloader(self):
+        # Use the same dataset for validation - in practice we'll use the EvaluationCallback
+        # for more thorough evaluation
+        return DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True
+        )
     
-    Args:
-        model: DDP wrapped model
-        optimizer: Optimizer state
-        epoch: Current epoch
-        loss: Current loss value
-        path: Path to save checkpoint
-    """
-    torch.save({
-        'epoch': epoch + 1,
-        'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'loss': loss,
-    }, path)
-    logging.info(f"Checkpoint saved to {path}")
+    def get_dataset_info(self):
+        """Return information about filtered sequences, etc."""
+        info = {}
+        if hasattr(self.dataset, 'filtered_ids'):
+            info['filtered_ids'] = self.dataset.filtered_ids
+        if hasattr(self.dataset, 'missing_pdb_ids'):
+            info['missing_pdb_ids'] = self.dataset.missing_pdb_ids
+        if hasattr(self.dataset, 'skipped_long_seqs'):
+            info['skipped_long_seqs'] = self.dataset.skipped_long_seqs
+        return info
 
-def evaluate_model(model, rank, world_size):
-    logging.info(f"[Rank {rank}] Starting evaluation")
-    model.eval()
+# PyTorch Lightning Module for RhoFold training
+class RhoFoldLightningModule(pl.LightningModule):
+    def __init__(self, config):
+        super().__init__()
+        self.save_hyperparameters(config)
+        self.model = RhoFold(rhofold_config)
+        self.automatic_optimization = False  # Handle optimization manually for more control
+        
+        # Set dropout rate
+        for module in self.model.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = config["dropout_rate"]
+        
+        # Initialize validation TM scores list for later aggregation
+        self.validation_tm_scores = []
     
-    def generator(features):
-        # Use torch.no_grad() during evaluation
+    def forward(self, tokens, rna_fm_tokens, seq, evo2_fea=None, train=False):
+        return self.model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=train)
+    
+    def training_step(self, batch, batch_idx):
+        # Get optimizer
+        opt = self.optimizers()
+        
+        # Extract batch data
+        seq_id = batch['seq_id'][0]
+        tokens = batch['tokens'][0]
+        rna_fm_tokens = batch['rna_fm_tokens'][0]
+        seq = batch['seq'][0]
+        pdb_data = batch['pdb_data']
+        pdb_data = {key: val[0] for key, val in pdb_data.items()}
+        
+        # Add dimensions if needed
+        while tokens.dim() < 3:
+            tokens = tokens.unsqueeze(0)
+        while rna_fm_tokens.dim() < 2:
+            rna_fm_tokens = rna_fm_tokens.unsqueeze(0)
+        
+        # Handle evo2 features
+        evo2_fea = None
+        if self.hparams["use_evo2"] and 'evo2_fea' in batch and batch['evo2_fea'] is not None:
+            evo2_fea = batch['evo2_fea'][0].to(torch.float32)
+        
+        # Zero gradients
+        opt.zero_grad()
+        
+        # Run model forward pass
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.trainer.precision == "bf16-mixed"):
+            outputs = self(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
+            
+            # Take the last output from recycles
+            output = outputs[-1]
+            
+            # Compute losses
+            fape_loss = compute_fape_loss(output, pdb_data, self.device)
+            tm_score_val = compute_tm_loss(output, pdb_data, self.device)
+            dist_loss = compute_dist_loss(output, pdb_data, self.device)
+            
+            # Combined loss: FAPE - 100 * TM score + 0.3 * dist_loss
+            loss = 2 * fape_loss - 100 * tm_score_val + 0.3 * dist_loss
+            
+            # Scale the loss for gradient accumulation
+            loss = loss / self.hparams["grad_accum_steps"]
+        
+        # Backward pass
+        self.manual_backward(loss)
+        
+        # Update weights if we've accumulated enough gradients
+        if (batch_idx + 1) % self.hparams["grad_accum_steps"] == 0:
+            # Clip gradients
+            self.clip_gradients(opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+            
+            # Check for NaN gradients and replace with zeros
+            nan_count = 0
+            for param in self.parameters():
+                if param.grad is not None:
+                    nan_mask = torch.isnan(param.grad)
+                    if nan_mask.any():
+                        nan_count += nan_mask.sum().item()
+                        param.grad[nan_mask] = 0.0
+            
+            # Step the optimizer
+            opt.step()
+            opt.zero_grad()
+            
+            # Step the learning rate schedulers
+            schedulers = self.lr_schedulers()
+            
+            # Step the warmup scheduler every step
+            if isinstance(schedulers, list) and len(schedulers) > 0:
+                # First scheduler is the warmup scheduler (step-based)
+                if self.global_step < self.hparams["warmup_steps"]:
+                    schedulers[0].step()
+        
+        # Log metrics
+        self.log("train_loss", loss * self.hparams["grad_accum_steps"], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train_fape_loss", fape_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_tm_score", tm_score_val, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_dist_loss", dist_loss, on_step=True, on_epoch=True, sync_dist=True)
+        
+        if "plddt" in output:
+            self.log("pLDDT", output["plddt"][1].item(), on_step=True, sync_dist=True)
+        
+        self.log("seq_length", len(seq), on_step=True, sync_dist=True)
+        self.log("nan_count", float(nan_count), on_step=True, on_epoch=True, sync_dist=True)
+        
+        # Log evo2head norm
+        evo2head_norm = get_evo2head_norm(self)
+        self.log("evo2head_norm", evo2head_norm, on_step=True, on_epoch=True, sync_dist=True)
+        
+        # Log learning rates
+        self.log("lr_evo2", opt.param_groups[0]['lr'], on_step=True, sync_dist=True)
+        self.log("lr_main", opt.param_groups[1]['lr'], on_step=True, sync_dist=True)
+        
+        return {"loss": loss * self.hparams["grad_accum_steps"]}
+    
+    def validation_step(self, batch, batch_idx):
+        # For proper validation, this should coordinate with the other processes
+        # But since the EvaluationCallback will use the original eval_model function,
+        # we can make this lightweight
+        # Extract batch data for validation
+        seq_id = batch['seq_id'][0]
+        tokens = batch['tokens'][0]
+        rna_fm_tokens = batch['rna_fm_tokens'][0]
+        seq = batch['seq'][0]
+        pdb_data = batch['pdb_data']
+        pdb_data = {key: val[0] for key, val in pdb_data.items()}
+        
+        # Add dimensions if needed
+        while tokens.dim() < 3:
+            tokens = tokens.unsqueeze(0)
+        while rna_fm_tokens.dim() < 2:
+            rna_fm_tokens = rna_fm_tokens.unsqueeze(0)
+        
+        # Handle evo2 features
+        evo2_fea = None
+        if self.hparams["use_evo2"] and 'evo2_fea' in batch and batch['evo2_fea'] is not None:
+            evo2_fea = batch['evo2_fea'][0].to(torch.float32)
+        
         with torch.no_grad():
+            # Run model forward pass
+            outputs = self(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea)
+            
+            # Take the last output from recycles
+            output = outputs[-1]
+            
+            # Compute validation metrics
+            fape_loss = compute_fape_loss(output, pdb_data, self.device)
+            tm_score_val = compute_tm_loss(output, pdb_data, self.device)
+            dist_loss = compute_dist_loss(output, pdb_data, self.device)
+            
+            # Log validation metrics
+            self.log("val_fape_loss", fape_loss, sync_dist=True)
+            self.log("val_tm_score", tm_score_val, sync_dist=True)
+            self.log("val_dist_loss", dist_loss, sync_dist=True)
+            
+            # Store TM score for on_validation_epoch_end
+            self.validation_tm_scores.append(tm_score_val)
+    
+    def on_validation_epoch_end(self):
+        # Skip if no validation was performed
+        if not self.validation_tm_scores:
+            self.log("eval_tm_score", 0.0, prog_bar=True, sync_dist=True)
+            return
+        
+        # Calculate average TM score
+        avg_tm_score = torch.stack(self.validation_tm_scores).mean()
+        
+        # Log the aggregated score
+        self.log("eval_tm_score", avg_tm_score, prog_bar=True, sync_dist=True)
+        
+        # Reset the list for next epoch
+        self.validation_tm_scores = []
+    
+    def configure_optimizers(self):
+        # Initialize optimizer with parameter groups
+        # Group 1: evo2_head parameters with higher learning rate
+        # Group 2: All other parameters with default learning rate
+        evo2_params = []
+        other_params = []
+        
+        for name, param in self.model.named_parameters():
+            if 'evo2_head' in name:
+                evo2_params.append(param)
+            else:
+                other_params.append(param)
+        
+        param_groups = [
+            {'params': evo2_params, 'lr': self.hparams["evo2_lr"]},
+            {'params': other_params, 'lr': self.hparams["learning_rate"]}
+        ]
+        
+        optimizer = torch.optim.Adam(param_groups, weight_decay=self.hparams["weight_decay"])
+        
+        # Warmup scheduler as the first scheduler
+        warmup_scheduler = {
+            'scheduler': torch.optim.lr_scheduler.LambdaLR(
+                optimizer, 
+                lr_lambda=lambda step: min(1.0, float(step) / float(self.hparams["warmup_steps"]))
+            ),
+            'interval': 'step',
+            'frequency': 1,
+            'name': 'warmup_scheduler',
+            # Only apply warmup during the warmup period
+            'monitor': 'step',
+        }
+        
+        # Cosine annealing scheduler for after warmup
+        cosine_scheduler = {
+            'scheduler': torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.hparams["num_epochs"],
+                eta_min=self.hparams["learning_rate"] * 0.01  # Minimum LR = 1% of initial rate
+            ),
+            'interval': 'epoch',
+            'frequency': 1,
+            'name': 'cosine_scheduler',
+        }
+        
+        return [optimizer], [warmup_scheduler, cosine_scheduler]
+
+# Custom callback for evaluation during training
+class EvaluationCallback(pl.Callback):
+    def __init__(self, eval_per_epoch=EVAL_PER_EPOCH):
+        super().__init__()
+        self.eval_per_epoch = eval_per_epoch
+    
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Run evaluation at regular intervals
+        total_batches = len(trainer.train_dataloader)
+        eval_interval = max(1, total_batches // self.eval_per_epoch)
+        
+        if batch_idx % eval_interval == 0 and batch_idx > 0:
+            # Temporarily set model to eval mode
+            pl_module.eval()
+            
+            # Run evaluation
             try:
+                self._run_evaluation(trainer, pl_module)
+            except Exception as e:
+                print(f"Evaluation error: {str(e)}")
+            finally:
+                # Return to train mode
+                pl_module.train()
+                torch.cuda.empty_cache()
+    
+    def _run_evaluation(self, trainer, pl_module):
+        print(f"\n[Evaluation] Running during training...")
+        
+        # Create a generator function for eval_model that matches the expected interface
+        def generator(features):
+            with torch.no_grad():
+                try:
+                    if "evo2_fea" in features:
+                        features["evo2_fea"] = features["evo2_fea"].to(torch.float32)
+                    
+                    outputs = pl_module(
+                        tokens=features["tokens"].to(pl_module.device),
+                        rna_fm_tokens=features["rna_fm_tokens"].to(pl_module.device),
+                        seq=features["seq"],
+                        evo2_fea=features["evo2_fea"].to(pl_module.device) if "evo2_fea" in features else None
+                    )
+                    
+                    preds = []
+                    for i in range(min(5, len(outputs))):
+                        preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
+                    return preds
+                except Exception as e:
+                    print(f"Error in generator: {str(e)}")
+                    return []
+        
+        try:
+            # Run evaluation using the original eval_model function
+            # This function handles distributed evaluation internally
+            eval_score = eval_model(generator)
+            
+            # Only log metrics on the main process as eval_model already handles aggregation
+            if trainer.is_global_zero:
+                trainer.logger.log_metrics({"eval_tm_score": eval_score})
+                print(f"[Evaluation] TM Score: {eval_score:.4f}")
+            
+        except Exception as e:
+            print(f"Evaluation block error: {str(e)}")
+
+def train(args):
+    """Main training function using PyTorch Lightning"""
+    # Set seed for reproducibility
+    pl.seed_everything(42)
+    
+    # Print the PyTorch version and available GPU info
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"GPU count: {torch.cuda.device_count()}")
+        print(f"GPU 0 name: {torch.cuda.get_device_name(0)}")
+    
+    # Check if bf16 is supported
+    bf16_supported = torch.cuda.is_bf16_supported()
+    print(f"BF16 supported: {bf16_supported}")
+    
+    # Create configuration dict for the Lightning module
+    config = {
+        "learning_rate": LEARNING_RATE,
+        "evo2_lr": EVO2_LR,
+        "num_epochs": NUM_EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "use_evo2": USE_EVO2,
+        "skip_short_seqs": SKIP_SHORT_SEQS,
+        "grad_accum_steps": GRAD_ACCUM_STEPS,
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "weight_decay": WEIGHT_DECAY,
+        "dropout_rate": DROPOUT_RATE,
+        "warmup_steps": WARMUP_STEPS,
+    }
+    
+    # Create Lightning module
+    model = RhoFoldLightningModule(config)
+    
+    # Apply torch.compile if requested and available
+    if args.use_compile and hasattr(torch, 'compile'):
+        try:
+            print("Attempting to compile model with torch.compile()...")
+            model.model = torch.compile(model.model, dynamic=True)
+            print("Model compilation successful")
+        except Exception as e:
+            print(f"Model compilation failed, using eager mode: {str(e)}")
+    
+    # Create dataset
+    dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2, max_seq_length=MAX_SEQ_LENGTH, preload_pdbs=True)
+    
+    # Configure data loaders
+    train_loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    
+    # Configure loggers
+    loggers = []
+    if args.use_wandb:
+        wandb_logger = WandbLogger(
+            project=WANDB_PROJECT,
+            name=f"rhofold_bf16_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            log_model=True
+        )
+        loggers.append(wandb_logger)
+    
+    # Configure callbacks
+    callbacks = [
+        # Checkpoint callback to save best models
+        ModelCheckpoint(
+            dirpath=CHECKPOINT_DIR,
+            filename='rhofold-{epoch:02d}-{eval_tm_score:.4f}',
+            monitor='eval_tm_score',
+            mode='max',
+            save_top_k=3,
+            save_last=True,
+            every_n_epochs=CHECKPOINT_EVERY
+        ),
+        # Learning rate monitor
+        LearningRateMonitor(logging_interval='step'),
+        # Custom evaluation callback
+        EvaluationCallback(eval_per_epoch=EVAL_PER_EPOCH)
+    ]
+    
+    # Configure DDP strategy
+    strategy = DDPStrategy(
+        find_unused_parameters=True,  # Required for RhoFold architecture
+        static_graph=False
+    )
+    
+    # Configure precision based on hardware support
+    precision = "bf16-mixed" if bf16_supported else "32"
+    
+    # Create Lightning trainer
+    trainer = pl.Trainer(
+        max_epochs=NUM_EPOCHS,
+        logger=loggers,
+        callbacks=callbacks,
+        accumulate_grad_batches=GRAD_ACCUM_STEPS,
+        strategy=strategy,
+        precision=precision,  # Use bf16 mixed precision when supported
+        log_every_n_steps=10,
+        default_root_dir=CHECKPOINT_DIR,
+    )
+    
+    # Load checkpoint if provided
+    if args.checkpoint:
+        print(f"Loading checkpoint from {args.checkpoint}")
+        # This will only load the model parameters, not the optimizer state
+        checkpoint = torch.load(args.checkpoint, map_location="cpu")
+        
+        # Handle model loading with compatibility for DDP and non-DDP checkpoints
+        if 'state_dict' in checkpoint:
+            if any(k.startswith('model.') for k in checkpoint['state_dict']):
+                # DDP checkpoint
+                state_dict = {k.replace('model.', ''): v for k, v in checkpoint['state_dict'].items()
+                             if k.startswith('model.')}
+            else:
+                # Non-DDP checkpoint
+                state_dict = checkpoint['state_dict']
+        else:
+            # Raw state dict
+            state_dict = checkpoint
+        
+        # Load state dict into model
+        model.model.load_state_dict(state_dict, strict=False)
+        print("Checkpoint loaded successfully.")
+    
+    # Log dataset info if available
+    if hasattr(dataset, 'filtered_ids'):
+        print(f"Filtered out {len(dataset.filtered_ids)} sequences due to dimension mismatch")
+    if hasattr(dataset, 'missing_pdb_ids'):
+        print(f"Filtered out {len(dataset.missing_pdb_ids)} sequences with missing or invalid PDB files")
+    if hasattr(dataset, 'skipped_long_seqs'):
+        print(f"Skipped {len(dataset.skipped_long_seqs)} long sequences (> {MAX_SEQ_LENGTH})")
+    
+    # Train the model
+    trainer.fit(model, train_loader)
+    
+    # Load and evaluate the best model
+    best_checkpoint_path = trainer.checkpoint_callback.best_model_path
+    if best_checkpoint_path:
+        print(f"Best model checkpoint: {best_checkpoint_path}")
+        
+        # Load best model for final evaluation
+        best_model = RhoFoldLightningModule.load_from_checkpoint(best_checkpoint_path)
+        best_model.eval()
+        
+        # Create a generator function for eval_model
+        def generator(features):
+            with torch.no_grad():
                 if "evo2_fea" in features:
                     features["evo2_fea"] = features["evo2_fea"].to(torch.float32)
                 
-                outputs = model.module(
-                    tokens=features["tokens"].to(model.device),
-                    rna_fm_tokens=features["rna_fm_tokens"].to(model.device),
+                outputs = best_model(
+                    tokens=features["tokens"].to(best_model.device),
+                    rna_fm_tokens=features["rna_fm_tokens"].to(best_model.device),
                     seq=features["seq"],
-                    evo2_fea=features["evo2_fea"].to(model.device) if "evo2_fea" in features else None
+                    evo2_fea=features["evo2_fea"].to(best_model.device) if "evo2_fea" in features else None
                 )
                 
                 preds = []
                 for i in range(min(5, len(outputs))):
                     preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
                 return preds
-            except Exception as e:
-                logging.error(f"[Rank {rank}] Error in generator: {str(e)} on sequence {features.get('seq_id', 'unknown')}")
-                return []
+        
+        # Run final evaluation
+        final_score = eval_model(generator)
+        print(f"Final evaluation TM score: {final_score:.4f}")
+        
+        if args.use_wandb and trainer.is_global_zero:
+            wandb.log({"final_tm_score": final_score})
     
-    try:
-        # Add timeout to prevent indefinite hangs
-        eval_score = eval_model(generator)
-        
-        # Synchronize scores across all processes
-        score_tensor = torch.tensor([eval_score], device=model.device)
-        dist.all_reduce(score_tensor, op=dist.ReduceOp.MAX)
-        eval_score = score_tensor.item()
-        
-        return eval_score
-    except Exception as e:
-        logging.error(f"[Rank {rank}] Evaluation error: {str(e)}")
-        # Ensure all processes continue even if evaluation fails on some
-        error_tensor = torch.tensor([1.0], device=model.device)
-        dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
-        return 0.0
-    finally:
-        # Return to training mode
-        model.train()
-        # Free up memory
-        torch.cuda.empty_cache()
+    print("Training completed")
+    return model
 
-
-def train_worker(args):
-    """
-    Training process for a single worker/GPU using torchrun
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train RhoFold model")
+    parser.add_argument("--data_dir", type=str, default='/dev/shm', help="Path to RNA data directory")
+    parser.add_argument("--checkpoint", type=str, default='pretrained/RhoFold_pretrained.pt', help="Path to checkpoint to resume from")
+    parser.add_argument("--use_wandb", action="store_true", help="Enable W&B logging")
+    parser.add_argument("--use_compile", action="store_true", help="Use torch.compile for model compilation")
     
-    Args:
-        args: Command line arguments
-    """
-    # Setup distributed process (returns local_rank, global_rank, world_size)
-    local_rank, rank, world_size = setup_distributed()
-    
-    # Set this process's device based on local_rank
-    device = torch.device(f"cuda:{local_rank}")
-    
-    # Initialize wandb only on main process
-    if rank == 0 and args.use_wandb:
-        wandb.init(
-            project=WANDB_PROJECT,
-            config={
-                "learning_rate": LEARNING_RATE,
-                "epochs": NUM_EPOCHS,
-                "batch_size": BATCH_SIZE,
-                "use_evo2": USE_EVO2,
-                "skip_short_seqs": SKIP_SHORT_SEQS,
-                "precision": "fp32",
-                "grad_accum_steps": GRAD_ACCUM_STEPS,
-                "max_seq_length": MAX_SEQ_LENGTH,
-                "world_size": world_size,
-            }
-        )
-        logging.info(f"Initialized wandb with project={WANDB_PROJECT}")
-    
-    # Create checkpoint dir if it doesn't exist (only on main process)
-    if rank == 0:
-        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    
-    # Initialize model
-    model = RhoFold(rhofold_config).to(device)
-    
-    # Set dropout rate in model
-    for module in model.modules():
-        if isinstance(module, nn.Dropout):
-            module.p = DROPOUT_RATE
-    
-    # Synchronize model parameters across processes
-    for param in model.parameters():
-        dist.broadcast(param.data, src=0)
-    
-    # Only use torch.compile if explicitly requested
-    if args.use_compile and hasattr(torch, 'compile'):
-        try:
-            logging.info("Attempting to compile model with torch.compile()...")
-            model = torch.compile(model, dynamic=True)
-            logging.info("Model compilation successful")
-        except Exception as e:
-            logging.warning(f"Model compilation failed, using eager mode: {str(e)}")
-    else:
-        logging.info("Skipping model compilation, using eager mode")
-    
-    # Wrap model with DDP - find_unused_parameters needed for RhoFold architecture
-    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-    
-    if rank == 0:
-        param_count = sum(p.numel() for p in model.parameters())
-        print(f"Model initialized with {param_count:,} parameters")
-    
-    # Initialize optimizer with parameter groups
-    # Group 1: evo2_head parameters with higher learning rate
-    # Group 2: All other parameters with default learning rate
-    evo2_params = []
-    other_params = []
-    for name, param in model.named_parameters():
-        if 'evo2_head' in name:
-            evo2_params.append(param)
-        else:
-            other_params.append(param)
-    
-    param_groups = [
-        {'params': evo2_params, 'lr': EVO2_LR},
-        {'params': other_params, 'lr': LEARNING_RATE}
-    ]
-    
-    optimizer = torch.optim.Adam(param_groups, weight_decay=WEIGHT_DECAY)
-    
-    # Create warmup scheduler
-    def get_warmup_lr_lambda(current_step):
-        if current_step < WARMUP_STEPS:
-            return float(current_step) / float(max(1, WARMUP_STEPS))
-        return 1.0
-    
-    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_warmup_lr_lambda)
-    
-    # Learning rate scheduler - will be used after warmup
-    # Replace ReduceLROnPlateau with CosineAnnealingLR for cosine decay
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        T_max=NUM_EPOCHS,  # Full cosine cycle over remaining epochs
-        eta_min=LEARNING_RATE * 0.01  # Minimum learning rate will be 1% of initial rate
-    )
-    
-    # If starting from a checkpoint, load it
-    start_epoch = 0
-    if args.checkpoint:
-        start_epoch = load_checkpoint(model, args.checkpoint, rank)
-    
-    # Create dataset and dataloader with preloading enabled
-    dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2, max_seq_length=MAX_SEQ_LENGTH, preload_pdbs=True)
-    
-    # Create distributed sampler
-    sampler = DistributedSampler(
-        dataset, 
-        num_replicas=world_size, 
-        rank=rank,
-        shuffle=False,
-        drop_last=True
-    )
-    
-    # Create dataloader with pinned memory for faster CPU->GPU transfers
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=BATCH_SIZE, 
-        sampler=sampler,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True  # Keep workers alive between epochs
-    )
-    
-    # Training loop
-    global_step = 0
-    for epoch in range(start_epoch, NUM_EPOCHS):
-        epoch_loss = 0
-        epoch_fape_loss = 0
-        epoch_tm_score = 0
-        epoch_dist_loss = 0
-        optimizer.zero_grad()
-        
-        # Set epoch for sampler
-        sampler.set_epoch(epoch)
-        
-        # Synchronize at the beginning of each epoch
-        dist.barrier()
-        
-        # Create progress bar on main process only
-        if rank == 0:
-            pbar = tqdm(total=len(sampler), desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        
-        processed_batches = 0
-        total_batches = len(dataloader)
-        eval_interval = max(1, total_batches // EVAL_PER_EPOCH)  # Evaluate every 1/EVAL_PER_EPOCH of an epoch
-        
-        for batch_idx, batch in enumerate(dataloader):
-            # Run evaluation at regular intervals
-            if batch_idx % eval_interval == 0:
-                model.eval()
-                if rank == 0:
-                    print(f"\n[Evaluation] Running at {(batch_idx + 1) / total_batches * 100:.1f}% of epoch {epoch + 1}")
-                
-                # Make sure all processes are ready to evaluate
-                try:
-                    # Single barrier before evaluation
-                    dist.barrier()
-                    
-                    # Run evaluation
-                    eval_score = evaluate_model(model, rank, world_size)
-                    
-                    # Log evaluation metrics on main process
-                    if rank == 0 and args.use_wandb and eval_score > 0:
-                        wandb.log({
-                            "eval_tm_score": eval_score
-                        })
-                        print(f"[Evaluation] TM Score: {eval_score:.4f}")
-                    
-                    # Make sure all processes are done with evaluation before proceeding
-                    dist.barrier()
-                except Exception as e:
-                    logging.error(f"[Rank {rank}] Evaluation block error: {str(e)}")
-                    try:
-                        dist.barrier()
-                    except:
-                        logging.error(f"[Rank {rank}] Failed to synchronize after evaluation error")
-                
-                # Return to train mode
-                model.train()
-                
-                # Free memory after evaluation
-                torch.cuda.empty_cache()
-            
-            # Process batch data
-            seq_id = batch['seq_id'][0]
-            tokens = batch['tokens'][0].to(device)
-            rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
-            seq = batch['seq'][0]
-            pdb_data = batch['pdb_data']
-            pdb_data = {key : item[0] for key, item in pdb_data.items()}
-            
-            # Add dimensions if needed
-            while tokens.dim() < 3:
-                tokens = tokens.unsqueeze(0)
-            while rna_fm_tokens.dim() < 2:
-                rna_fm_tokens = rna_fm_tokens.unsqueeze(0)
-            
-            # Handle evo2 features
-            evo2_fea = None
-            if USE_EVO2 and batch['evo2_fea'] is not None:
-                evo2_fea = batch['evo2_fea'][0].to(device).to(torch.float32)
-            
-            # Run model forward pass
-            outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
-           
-            # Take the last output from recycles
-            output = outputs[-1]
-            
-            # Convert mask to device and compute losses
-            fape_loss = compute_fape_loss(output, pdb_data, device)
-            tm_score_val = compute_tm_loss(output, pdb_data, device)
-            dist_loss = compute_dist_loss(output, pdb_data, device)
-            
-            # Combined loss: FAPE - 20 * TM score
-            loss = 2 * fape_loss - 100 * tm_score_val + 0.3 * dist_loss
-            
-            # Scale the loss for gradient accumulation
-            loss = loss / GRAD_ACCUM_STEPS
-            
-            accum = (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader)
-            if accum:
-                # Backward pass
-                loss.backward()
-            else:
-                with model.no_sync():
-                    loss.backward()
-            
-            nan_count = 0
-            if accum:
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # Check for NaN gradients and replace with zeros
-                for param in model.parameters():
-                    if param.grad is not None:
-                        nan_mask = torch.isnan(param.grad)
-                        if nan_mask.any():
-                            nan_count += nan_mask.sum().item()
-                            param.grad[nan_mask] = 0.0
-                
-                optimizer.step()
-                optimizer.zero_grad()
-                if rank == 0 and args.use_wandb:
-                    wandb.log({
-                        "nan_count": nan_count
-                    })
-            
-            # Track loss
-            epoch_loss += loss.item()
-            epoch_fape_loss += fape_loss.item()
-            epoch_tm_score += tm_score_val
-            epoch_dist_loss += dist_loss.item()
-            processed_batches += 1
-            
-            # Log batch metrics on main process
-            if rank == 0 and args.use_wandb:
-                evo2head_norm = get_evo2head_norm(model)
-                wandb.log({
-                    "head_lr": optimizer.param_groups[0]['lr'],
-                    "batch_loss": loss.item(),
-                    "fape_loss": fape_loss.item(),
-                    "tm_score": tm_score_val,
-                    "dist_loss": dist_loss.item(),
-                    "pLDDT": output["plddt"][1].item() if "plddt" in output else 0.0,
-                    "seq_id": seq_id,
-                    "seq_length": len(seq),
-                    "memory_usage_MB": torch.cuda.memory_allocated(device) / 1024**2,
-                    "evo2head_norm": evo2head_norm,
-                    "epoch_avg_loss": epoch_loss / processed_batches,
-                    "epoch_avg_fape_loss": epoch_fape_loss / processed_batches,
-                    "epoch_avg_tm_score": epoch_tm_score / processed_batches,
-                    "epoch_avg_dist_loss": epoch_dist_loss / processed_batches,
-                })
-            
-            # Update progress bar on main process
-            if rank == 0:
-                pbar.update(1)
-                
-            # Update global step
-            global_step += 1
-            
-            # Apply warmup scheduler if still in warmup phase
-            if global_step <= WARMUP_STEPS:
-                warmup_scheduler.step()
-        
-        # Close progress bar on main process
-        if rank == 0:
-            pbar.close()
-        
-        # Calculate average epoch loss
-        if processed_batches > 0:
-            avg_loss = epoch_loss / processed_batches
-            avg_fape_loss = epoch_fape_loss / processed_batches
-            avg_tm_score = epoch_tm_score / processed_batches
-        else:
-            avg_loss = 0
-            avg_fape_loss = 0
-            avg_tm_score = 0
-            
-        logging.info(f"Rank {rank} - epoch {epoch+1} completed")
-        # Average loss across all processes
-        avg_loss_tensor = torch.tensor([avg_loss], device=device)
-        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
-        avg_loss = avg_loss_tensor.item() / world_size
-        
-        # Average FAPE loss across all processes
-        avg_fape_loss_tensor = torch.tensor([avg_fape_loss], device=device)
-        dist.all_reduce(avg_fape_loss_tensor, op=dist.ReduceOp.SUM)
-        avg_fape_loss = avg_fape_loss_tensor.item() / world_size
-        
-        # Average TM score across all processes
-        avg_tm_score_tensor = torch.tensor([avg_tm_score], device=device)
-        dist.all_reduce(avg_tm_score_tensor, op=dist.ReduceOp.SUM)
-        avg_tm_score = avg_tm_score_tensor.item() / world_size
-        
-        # Get total processed batches from all GPUs
-        processed_tensor = torch.tensor([processed_batches], device=device)
-        dist.all_reduce(processed_tensor, op=dist.ReduceOp.SUM)
-        total_processed = processed_tensor.item()
-        
-        # Log epoch metrics on main process
-        if rank == 0:
-            print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f} - FAPE Loss: {avg_fape_loss:.4f} - TM Score: {avg_tm_score:.4f} - Processed {total_processed} sequences")
-            if args.use_wandb:
-                wandb.log({
-                    "epoch": epoch + 1,
-                    "train_loss": avg_loss,
-                    "train_fape_loss": avg_fape_loss,
-                    "train_tm_score": avg_tm_score,
-                    "learning_rate": optimizer.param_groups[0]['lr'],
-                    "processed_sequences": total_processed
-                })
-        
-        logging.info(f"Rank {rank} - epoch {epoch+1} logging completed")
-        # Save checkpoint (on main process only)
-        if (epoch + 1) % CHECKPOINT_EVERY == 0 and rank == 0:
-            checkpoint_path = os.path.join(CHECKPOINT_DIR, f"rhofold_epoch_{epoch+1}.pt")
-            save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_path)
-        logging.info(f"Rank {rank} - epoch {epoch+1} checkpoint saved")
-    
-    # Save final model (on main process only)
-    if rank == 0:
-        final_checkpoint_path = os.path.join(CHECKPOINT_DIR, "rhofold_final.pt")
-        save_checkpoint(model, optimizer, NUM_EPOCHS - 1, avg_loss, final_checkpoint_path)
-        
-        # Print summary of filtered sequences
-        if hasattr(dataset, 'filtered_ids') and dataset.filtered_ids:
-            logging.info(f"Filtered {len(dataset.filtered_ids)} sequences due to token shape mismatch")
-        
-        # Print summary of sequences with missing PDB files
-        if hasattr(dataset, 'missing_pdb_ids') and dataset.missing_pdb_ids:
-            logging.info(f"Filtered {len(dataset.missing_pdb_ids)} sequences due to missing PDB files")
-            
-        # Print summary of skipped long sequences
-        if hasattr(dataset, 'skipped_long_seqs') and dataset.skipped_long_seqs:
-            logging.info(f"Skipped {len(dataset.skipped_long_seqs)} sequences with length > {MAX_SEQ_LENGTH}")
-        
-        if args.use_wandb:
-            wandb.finish()
-        print(f"Training completed. Final model saved to {final_checkpoint_path}")
-    
-    # Clean up distributed process
-    cleanup_distributed()
-
-
-def train(args):
-    """
-    Main training function that works with torchrun
-    
-    For torchrun, this function directly calls train_worker
-    instead of spawning processes, as torchrun handles process creation
-    """
-    try:
-        # When using torchrun, we directly call train_worker 
-        # as the processes are already spawned
-        train_worker(args)
-    except Exception as e:
-        logging.error(f"Training failed with error: {str(e)}")
-        # Make sure to clean up in case of error
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        
-        # Clean up any leaked semaphores
-        try:
-            import subprocess
-            # Find semaphores created by this user
-            result = subprocess.run(["ipcs", "-s"], capture_output=True, text=True)
-            semaphore_lines = result.stdout.strip().split("\n")
-            
-            # Get username for filtering
-            import getpass
-            username = getpass.getuser()
-            
-            # Extract semaphore IDs owned by this user
-            semaphore_ids = []
-            for line in semaphore_lines:
-                if username in line:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        semaphore_ids.append(parts[1])
-            
-            # Remove each semaphore
-            for sem_id in semaphore_ids:
-                subprocess.run(["ipcrm", "-s", sem_id])
-                logging.info(f"Cleaned up semaphore {sem_id}")
-        except Exception as cleanup_error:
-            logging.warning(f"Failed to clean up semaphores: {str(cleanup_error)}")
-        
-        # Re-raise the original exception
-        raise
-
-
-def main():
-    # Set environment variable to help debug DDP unused parameters
-    os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
-    
-    parser = argparse.ArgumentParser(description="Train RhoFold with FAPE loss")
-    parser.add_argument("--data_dir", type=str, default="/dev/shm", 
-                        help="Directory containing RNA data")
-    parser.add_argument("--checkpoint", type=str, default="./pretrained/RhoFold_pretrained.pt", 
-                        help="Path to checkpoint to resume training from")
-    parser.add_argument("--use_wandb", action="store_true", default=False,
-                        help="Whether to use Weights & Biases for logging")
-    parser.add_argument("--debug", action="store_true", default=False,
-                        help="Enable debug mode with more verbose logging")
-    parser.add_argument("--use_compile", action="store_true", default=False,
-                        help="Attempt to use torch.compile() to optimize model (may not work for all models)")
     args = parser.parse_args()
     
+    # Create checkpoint directory if it doesn't exist
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    
     # Configure logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    
-    # Include local rank in log format when running with torchrun
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    log_format = f"%(asctime)s [Rank {local_rank}] [%(levelname)s] %(message)s"
-    
     logging.basicConfig(
-        level=log_level,
-        format=log_format,
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(f"rhofold_training_rank{local_rank}.log")
+            logging.StreamHandler(),
+            logging.FileHandler(os.path.join(CHECKPOINT_DIR, "training.log"))
         ]
     )
     
-    # Set deterministic training for reproducibility
-    # Base seed is the same, but each rank gets a different derived seed
-    base_seed = 42
-    torch.manual_seed(base_seed)
-    np.random.seed(base_seed)
-    random.seed(base_seed)
-    
-    # Start the training process
+    # Train the model
     train(args)
-
-
-if __name__ == "__main__":
-    main()
