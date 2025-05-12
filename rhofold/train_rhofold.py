@@ -42,8 +42,8 @@ CHECKPOINT_DIR = "checkpoints"
 USE_EVO2 = True
 BATCH_SIZE = 1  # Keep batch size at 1 for each GPU
 NUM_EPOCHS = 20
-LEARNING_RATE = 1e-5
-EVO2_LR = 2e-4  # Higher learning rate for evo2_head
+LEARNING_RATE = 2e-7
+EVO2_LR = 1e-4  # Higher learning rate for evo2_head
 EVAL_PER_EPOCH = 4  # Number of evaluations per epoch
 CHECKPOINT_EVERY = 1
 WARMUP_STEPS = 1000
@@ -214,7 +214,21 @@ class RNADataset(Dataset):
             'pdb_path': pdb_path
         }
 
-def compute_tm_loss(output, pdb_path):
+def get_mask(tru_seq, pdb_seq):
+    # Given true seq and seq of residues covered by pdb, find mask of true seq that can match to pdb
+    assert len(tru_seq) >= len(pdb_seq), f"True sequence length {len(tru_seq)} is less than PDB sequence length {len(pdb_seq)}"
+    mask = torch.zeros(len(tru_seq), dtype=torch.bool)
+    pdb_ptr = 0
+    for i, res in enumerate(tru_seq):
+        if pdb_ptr < len(pdb_seq) and res == pdb_seq[pdb_ptr]:
+            pdb_ptr += 1
+            mask[i] = True
+    return mask
+
+def get_pdb_seq(structure):
+    return "".join([res.get_resname() for res in structure.get_residues()])
+
+def compute_tm_loss(output, tru_seq, pdb_path):
     pred_c1_positions = output["cords_c1'"][-1].squeeze(0)  # Shape [N, 3]
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("gt", pdb_path)
@@ -228,12 +242,12 @@ def compute_tm_loss(output, pdb_path):
         except:
             gt_c1_positions.append([0, 0, 0])
     gt_c1_positions = torch.tensor(np.array(gt_c1_positions), dtype=torch.float32, device=pred_c1_positions.device)
-    n_residues = min(pred_c1_positions.shape[0], gt_c1_positions.shape[0])
-    pred_c1_positions = pred_c1_positions[:n_residues]
-    gt_c1_positions = gt_c1_positions[:n_residues]
+    pdb_seq = get_pdb_seq(structure)
+    mask = get_mask(tru_seq, pdb_seq)
+    pred_c1_positions = pred_c1_positions[mask]
     return tm_score(pred_c1_positions, gt_c1_positions)
 
-def compute_fape_loss(output, pdb_path, length_scale=10.0, l1_clamp_distance=None):
+def compute_fape_loss(output, tru_seq, pdb_path, length_scale=10.0, l1_clamp_distance=None):
     """
     Compute FAPE loss between model output and ground truth PDB
     
@@ -288,17 +302,17 @@ def compute_fape_loss(output, pdb_path, length_scale=10.0, l1_clamp_distance=Non
     gt_c1_positions = torch.tensor(gt_c1_positions, dtype=dtype, device=device)
     
     # Create same-length arrays (truncate if necessary)
-    n_residues = min(pred_c1_positions.shape[0], gt_c1_positions.shape[0])
-    pred_c1_positions = pred_c1_positions[:n_residues]
-    gt_c1_positions = gt_c1_positions[:n_residues]
-    pred_frames = pred_frames[:n_residues]
+    pdb_seq = get_pdb_seq(structure)
+    mask = get_mask(tru_seq, pdb_seq)
+    pred_c1_positions = pred_c1_positions[mask]
+    pred_frames = pred_frames[mask]
     
     # Create a mask for the positions (all 1s since we've truncated to match)
-    mask = torch.ones(n_residues, device=device)
+    mask = torch.ones(len(pred_c1_positions), device=device)
     
     # Create target frames
-    zeros = torch.zeros(n_residues, 3, device=device, dtype=dtype)
-    ones = torch.ones(n_residues, 1, device=device, dtype=dtype)
+    zeros = torch.zeros(len(pred_c1_positions), 3, device=device, dtype=dtype)
+    ones = torch.ones(len(pred_c1_positions), 1, device=device, dtype=dtype)
     quats = torch.cat([ones, zeros], dim=-1)
     
     # Create target frames with identity rotations and ground truth C1' positions
@@ -321,6 +335,50 @@ def compute_fape_loss(output, pdb_path, length_scale=10.0, l1_clamp_distance=Non
     )
     
     return fape
+
+def compute_dist_loss(output, tru_seq, pdb_path):
+    # Extract predicted C1' positions
+    pred_p_dist = output["p"][-1].squeeze(0)  # Shape [40, N, N]
+    pred_c4_dist = output["c4_"][-1].squeeze(0)  # Shape [40, N, N]
+    pred_n_dist = output["n"][-1].squeeze(0)  # Shape [40, N, N]
+    pred_dist = torch.stack([pred_p_dist, pred_c4_dist, pred_n_dist], dim=0)
+    
+    # Parse the PDB to get ground truth p, c4, n positions
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("gt", pdb_path)
+    chain = next(structure.get_chains())
+
+    pdb_seq = get_pdb_seq(structure)
+    mask = get_mask(tru_seq, pdb_seq)
+    pred_dist = pred_dist[..., mask, :][..., :, mask]
+    
+    # Extract p, c4, n atoms from the PDB structure
+    gt_p_positions = []
+    gt_c4_positions = []
+    gt_n_positions = []
+    for res in chain:
+        try:
+            gt_p_positions.append(res["p"].get_coord())
+            gt_c4_positions.append(res["c4_"].get_coord())
+            gt_n_positions.append(res["n"].get_coord())
+        except:
+            gt_p_positions.append(gt_p_positions[-1] if gt_p_positions else [0, 0, 0])
+            gt_c4_positions.append(gt_c4_positions[-1] if gt_c4_positions else [0, 0, 0])
+            gt_n_positions.append(gt_n_positions[-1] if gt_n_positions else [0, 0, 0])
+
+    positions = np.array([gt_p_positions, gt_c4_positions, gt_n_positions])
+
+    gt_positions = torch.tensor(positions, device=pred_p_dist.device, dtype=torch.float32) # shape [3, N, 3]
+    gt_dist = (gt_positions[..., None, :] - gt_positions[..., None, :, :]).norm(dim=-1) # shape [3, N, N]
+
+    boundaries = torch.linspace(2, 40, 39, device=pred_p_dist.device)
+
+    true_bins = torch.sum(gt_dist[..., None] > boundaries, dim=-1) # shape [3, N, N]
+
+    loss_fn = nn.CrossEntropyLoss(reduction='mean')
+    loss = loss_fn(pred_dist, true_bins)
+    
+    return loss
 
 def load_checkpoint(model, checkpoint_path, rank):
     """
@@ -507,7 +565,7 @@ def train_worker(args):
     
     param_groups = [
         {'params': evo2_params, 'lr': EVO2_LR},
-        # {'params': other_params, 'lr': LEARNING_RATE}
+        {'params': other_params, 'lr': LEARNING_RATE}
     ]
     
     optimizer = torch.optim.Adam(param_groups, weight_decay=WEIGHT_DECAY)
@@ -561,6 +619,7 @@ def train_worker(args):
         epoch_loss = 0
         epoch_fape_loss = 0
         epoch_tm_score = 0
+        epoch_dist_loss = 0
         optimizer.zero_grad()
         
         # Set epoch for sampler
@@ -638,21 +697,17 @@ def train_worker(args):
             
             # Run model forward pass
             outputs = model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
-            
+           
             # Take the last output from recycles
             output = outputs[-1]
             
             # Compute FAPE loss
-            fape_loss = compute_fape_loss(output, pdb_path)
-            
-            # Calculate TM score for the current prediction
-            # Extract the predicted coordinates for TM score calculation
-            pred_coords = output["cords_c1'"][-1].squeeze(0).cpu().detach().numpy()
-            # Calculate TM score between prediction and ground truth
-            tm_score = compute_tm_loss(output, pdb_path)
+            fape_loss = compute_fape_loss(output, seq, pdb_path)
+            tm_score = compute_tm_loss(output, seq, pdb_path)
+            dist_loss = compute_dist_loss(output, seq, pdb_path)
             
             # Combined loss: FAPE - 20 * TM score
-            loss = fape_loss - 20.0 * tm_score
+            loss = 2 * fape_loss - 500 * tm_score + 0.3 * dist_loss
             
             # Scale the loss for gradient accumulation
             loss = loss / GRAD_ACCUM_STEPS
@@ -689,16 +744,18 @@ def train_worker(args):
             epoch_loss += loss.item()
             epoch_fape_loss += fape_loss.item()
             epoch_tm_score += tm_score
+            epoch_dist_loss += dist_loss.item()
             processed_batches += 1
             
             # Log batch metrics on main process
             if rank == 0 and args.use_wandb:
                 evo2head_norm = get_evo2head_norm(model)
                 wandb.log({
+                    "head_lr": optimizer.param_groups[0]['lr'],
                     "batch_loss": loss.item(),
                     "fape_loss": fape_loss.item(),
                     "tm_score": tm_score,
-                    "tm_score_weighted": 20.0 * tm_score,
+                    "dist_loss": dist_loss.item(),
                     "pLDDT": output["plddt"][1].item() if "plddt" in output else 0.0,
                     "seq_id": seq_id,
                     "seq_length": len(seq),
@@ -707,6 +764,7 @@ def train_worker(args):
                     "epoch_avg_loss": epoch_loss / processed_batches,
                     "epoch_avg_fape_loss": epoch_fape_loss / processed_batches,
                     "epoch_avg_tm_score": epoch_tm_score / processed_batches,
+                    "epoch_avg_dist_loss": epoch_dist_loss / processed_batches,
                 })
             
             # Update progress bar on main process
