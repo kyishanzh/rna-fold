@@ -105,11 +105,85 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def get_mask(tru_seq, pdb_seq):
+    # Given true seq and seq of residues covered by pdb, find mask of true seq that can match to pdb
+    assert len(tru_seq) >= len(pdb_seq), f"True sequence length {len(tru_seq)} is less than PDB sequence length {len(pdb_seq)}"
+    mask = torch.zeros(len(tru_seq), dtype=torch.bool)
+    pdb_ptr = 0
+    for i, res in enumerate(tru_seq):
+        if pdb_ptr < len(pdb_seq) and res == pdb_seq[pdb_ptr]:
+            pdb_ptr += 1
+            mask[i] = True
+    return mask
+
+
+def get_pdb_seq(structure):
+    return "".join([res.get_resname() for res in structure.get_residues()])
+
+
+def extract_atom_positions_from_pdb(pdb_path, tru_seq):
+    """
+    Extract atom positions from PDB file and apply sequence mask
+    Returns dict with C1', P, C4, and N atom positions, plus seq mask and pdb_seq
+    """
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("gt", pdb_path)
+    chain = next(structure.get_chains())
+    
+    # Extract atoms from the PDB structure
+    gt_c1_positions = []
+    gt_p_positions = []
+    gt_c4_positions = []
+    gt_n_positions = []
+    
+    for res in chain:
+        try:
+            gt_c1_positions.append(res["C1'"].get_coord())
+        except:
+            gt_c1_positions.append([0, 0, 0])
+        
+        try:
+            gt_p_positions.append(res["p"].get_coord())
+        except:
+            gt_p_positions.append(gt_p_positions[-1] if gt_p_positions else [0, 0, 0])
+        
+        try:
+            gt_c4_positions.append(res["c4_"].get_coord())
+        except:
+            gt_c4_positions.append(gt_c4_positions[-1] if gt_c4_positions else [0, 0, 0])
+        
+        try:
+            gt_n_positions.append(res["n"].get_coord())
+        except:
+            gt_n_positions.append(gt_n_positions[-1] if gt_n_positions else [0, 0, 0])
+    
+    # Convert to numpy arrays
+    gt_c1_positions = np.array(gt_c1_positions)
+    gt_dist_positions = np.array([gt_p_positions, gt_c4_positions, gt_n_positions])
+    
+    # Get PDB sequence and mask
+    pdb_seq = get_pdb_seq(structure)
+    mask = get_mask(tru_seq, pdb_seq)
+    
+    return {
+        'c1_positions': gt_c1_positions,
+        'dist_positions': gt_dist_positions,
+        'mask': mask,
+        'pdb_seq': pdb_seq
+    }
+
+
 class RNADataset(Dataset):
-    def __init__(self, data_dir, use_evo2=True, max_seq_length=MAX_SEQ_LENGTH):
+    def __init__(self, data_dir, use_evo2=True, max_seq_length=MAX_SEQ_LENGTH, preload_pdbs=True):
         self.data_dir = data_dir
         self.use_evo2 = use_evo2
         self.max_seq_length = max_seq_length
+        self.preload_pdbs = preload_pdbs
+        
+        # For caching loaded data
+        self.cached_features = {}
+        self.cached_evo2_embeddings = {}
+        self.cached_pdb_data = {}
 
         if not USE_RHOFOLD_DATA:
             self.seq_ids = all_seq_ids()
@@ -176,6 +250,61 @@ class RNADataset(Dataset):
             logging.info(f"Filtered out {len(self.missing_pdb_ids)} sequences with missing PDB files")
         if self.skipped_long_seqs:
             logging.info(f"Skipped {len(self.skipped_long_seqs)} sequences with length > {MAX_SEQ_LENGTH}")
+            
+        # Preload data if enabled
+        if self.preload_pdbs:
+            self._preload_data()
+    
+    def _preload_data(self):
+        """Preload all sequence data, evo2 embeddings, and PDB data to avoid disk I/O during training"""
+        logging.info(f"Preloading data for {len(self.seq_ids)} sequences...")
+        
+        for idx, seq_id in enumerate(tqdm(self.seq_ids, desc="Preloading data")):
+            # Load sequence and MSA features
+            if USE_RHOFOLD_DATA:
+                input_fas = os.path.join(self.data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
+                input_a3m = os.path.join(self.data_dir, f"RNA3D_DATA/rMSA/{seq_id}.a3m")
+                data_dict = get_features(input_fas, input_a3m)
+            else:
+                input_fas = os.path.join(self.data_dir, f"MSA/{seq_id}.fasta")
+                input_a3m = os.path.join(self.data_dir, f"MSA/{seq_id}.MSA.fasta")
+                data_dict = get_features(input_fas, input_a3m)
+            
+            # Skip if token dimensions don't match
+            if data_dict['tokens'].shape[-1] != data_dict['rna_fm_tokens'].shape[-1]:
+                if seq_id not in self.filtered_ids:
+                    self.filtered_ids.append(seq_id)
+                continue
+            
+            # Load evo2 embedding
+            evo2_embedding = None
+            if self.use_evo2:
+                if USE_RHOFOLD_DATA:
+                    embeddings_dir = os.path.join(self.data_dir, "RNA3D_DATA/evo2_embeddings")
+                else:
+                    embeddings_dir = os.path.join(self.data_dir, "evo2_embeddings")
+                embedding_path = os.path.join(embeddings_dir, f"{seq_id}.pt")
+                evo2_embedding = torch.load(embedding_path)
+                self.cached_evo2_embeddings[seq_id] = evo2_embedding
+            
+            # Load PDB data
+            if USE_RHOFOLD_DATA:
+                pdb_path = os.path.join(self.data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
+            else:
+                pdb_path = os.path.join(self.data_dir, f"pdb/{seq_id}.pdb")
+            
+            # Extract atom positions from PDB
+            pdb_data = extract_atom_positions_from_pdb(pdb_path, data_dict['seq'])
+            
+            # Cache all data
+            self.cached_features[seq_id] = {
+                'tokens': data_dict['tokens'],
+                'rna_fm_tokens': data_dict['rna_fm_tokens'],
+                'seq': data_dict['seq']
+            }
+            self.cached_pdb_data[seq_id] = pdb_data
+            
+        logging.info(f"Preloaded data for {len(self.cached_features)} sequences")
     
     def __len__(self):
         return len(self.seq_ids)
@@ -183,6 +312,22 @@ class RNADataset(Dataset):
     def __getitem__(self, idx):
         seq_id = self.seq_ids[idx]
         
+        # Return cached data if available
+        if self.preload_pdbs and seq_id in self.cached_features:
+            data_dict = self.cached_features[seq_id]
+            evo2_embedding = self.cached_evo2_embeddings[seq_id]
+            pdb_data = self.cached_pdb_data[seq_id]
+            
+            return {
+                'seq_id': seq_id,
+                'tokens': data_dict['tokens'],
+                'rna_fm_tokens': data_dict['rna_fm_tokens'],
+                'seq': data_dict['seq'],
+                'evo2_fea': evo2_embedding,
+                'pdb_data': pdb_data,
+            }
+        
+        # Load data from disk if not preloaded
         # Load sequence and MSA features
         if USE_RHOFOLD_DATA:
             input_fas = os.path.join(self.data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
@@ -213,11 +358,16 @@ class RNADataset(Dataset):
             evo2_embedding = torch.load(embedding_path)
         
         # Get PDB path for ground truth
-        pdb_path = os.path.join(self.data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
+        if USE_RHOFOLD_DATA:
+            pdb_path = os.path.join(self.data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
+        else:
+            pdb_path = os.path.join(self.data_dir, f"pdb/{seq_id}.pdb")
+        
         # This check is redundant now, but kept for safety
         assert os.path.exists(pdb_path), f"PDB file not found: {pdb_path}"
-
-        assert None not in [seq_id, data_dict['tokens'], data_dict['rna_fm_tokens'], data_dict['seq'], evo2_embedding, pdb_path]
+        
+        # Extract atom positions from PDB
+        pdb_data = extract_atom_positions_from_pdb(pdb_path, data_dict['seq'])
 
         return {
             'seq_id': seq_id,
@@ -225,56 +375,27 @@ class RNADataset(Dataset):
             'rna_fm_tokens': data_dict['rna_fm_tokens'],
             'seq': data_dict['seq'],
             'evo2_fea': evo2_embedding,
-            'pdb_path': pdb_path
+            'pdb_data': pdb_data,
         }
 
-def get_mask(tru_seq, pdb_seq):
-    # Given true seq and seq of residues covered by pdb, find mask of true seq that can match to pdb
-    assert len(tru_seq) >= len(pdb_seq), f"True sequence length {len(tru_seq)} is less than PDB sequence length {len(pdb_seq)}"
-    mask = torch.zeros(len(tru_seq), dtype=torch.bool)
-    pdb_ptr = 0
-    for i, res in enumerate(tru_seq):
-        if pdb_ptr < len(pdb_seq) and res == pdb_seq[pdb_ptr]:
-            pdb_ptr += 1
-            mask[i] = True
-    return mask
 
-def get_pdb_seq(structure):
-    return "".join([res.get_resname() for res in structure.get_residues()])
-
-def compute_tm_loss(output, tru_seq, pdb_path):
+def compute_tm_loss(output, pdb_data, device):
+    """Compute TM score loss using preloaded PDB data"""
     pred_c1_positions = output["cords_c1'"][-1].squeeze(0)  # Shape [N, 3]
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("gt", pdb_path)
-    chain = next(structure.get_chains())
     
-    # Extract C1' atoms from the PDB structure
-    gt_c1_positions = []
-    for res in chain:
-        try:
-            gt_c1_positions.append(res["C1'"].get_coord())
-        except:
-            gt_c1_positions.append([0, 0, 0])
-    gt_c1_positions = torch.tensor(np.array(gt_c1_positions), dtype=torch.float32, device=pred_c1_positions.device)
-    pdb_seq = get_pdb_seq(structure)
-    mask = get_mask(tru_seq, pdb_seq)
+    # Get ground truth positions and mask from preloaded data
+    gt_c1_positions = pdb_data['c1_positions'].to(device).float()
+    mask = pdb_data['mask'].to(device)
+    
+    # Apply mask to predicted positions
     pred_c1_positions = pred_c1_positions[mask]
+    
+    # Compute TM score
     return tm_score(pred_c1_positions, gt_c1_positions)
 
-def compute_fape_loss(output, tru_seq, pdb_path, length_scale=10.0, l1_clamp_distance=None):
-    """
-    Compute FAPE loss between model output and ground truth PDB
-    
-    Args:
-        output: Dictionary containing model output predictions
-        pdb_path: Path to ground truth PDB file
-        chain_id: Optional chain ID to use from PDB
-        length_scale: Scale factor for FAPE calculation
-        l1_clamp_distance: Distance threshold for L1 clamping
-        
-    Returns:
-        FAPE loss value
-    """
+
+def compute_fape_loss(output, pdb_data, device, length_scale=10.0, l1_clamp_distance=None):
+    """Compute FAPE loss using preloaded PDB data"""
     # Extract predicted frames
     pred_frames_tensor = output["frames"]
     
@@ -296,37 +417,20 @@ def compute_fape_loss(output, tru_seq, pdb_path, length_scale=10.0, l1_clamp_dis
     # Extract predicted C1' positions
     pred_c1_positions = output["cords_c1'"][-1].squeeze(0)  # Shape [N, 3]
     
-    # Parse the PDB to get ground truth C1' positions
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("gt", pdb_path)
-    chain = next(structure.get_chains())
+    # Get ground truth positions and mask from preloaded data
+    gt_c1_positions = pdb_data['c1_positions'].to(device).float()
+    mask = pdb_data['mask'].to(device)
     
-    # Extract C1' atoms from the PDB structure
-    gt_c1_positions = []
-    for res in chain:
-        try:
-            gt_c1_positions.append(res["C1'"].get_coord())
-        except:
-            gt_c1_positions.append([0, 0, 0])
-    gt_c1_positions = np.array(gt_c1_positions)
-    
-    # Convert to tensor with same dtype and device as predictions
-    dtype = pred_frames_tensor.dtype
-    device = pred_frames_tensor.device
-    gt_c1_positions = torch.tensor(gt_c1_positions, dtype=dtype, device=device)
-    
-    # Create same-length arrays (truncate if necessary)
-    pdb_seq = get_pdb_seq(structure)
-    mask = get_mask(tru_seq, pdb_seq)
+    # Apply mask to predictions
     pred_c1_positions = pred_c1_positions[mask]
     pred_frames = pred_frames[mask]
     
     # Create a mask for the positions (all 1s since we've truncated to match)
-    mask = torch.ones(len(pred_c1_positions), device=device)
+    pos_mask = torch.ones(len(pred_c1_positions), device=device)
     
     # Create target frames
-    zeros = torch.zeros(len(pred_c1_positions), 3, device=device, dtype=dtype)
-    ones = torch.ones(len(pred_c1_positions), 1, device=device, dtype=dtype)
+    zeros = torch.zeros(len(pred_c1_positions), 3, device=device, dtype=pred_frames_tensor.dtype)
+    ones = torch.ones(len(pred_c1_positions), 1, device=device, dtype=pred_frames_tensor.dtype)
     quats = torch.cat([ones, zeros], dim=-1)
     
     # Create target frames with identity rotations and ground truth C1' positions
@@ -339,10 +443,10 @@ def compute_fape_loss(output, tru_seq, pdb_path, length_scale=10.0, l1_clamp_dis
     fape = compute_fape(
         pred_frames=pred_frames,
         target_frames=target_frames,
-        frames_mask=mask,
+        frames_mask=pos_mask,
         pred_positions=pred_c1_positions,
         target_positions=gt_c1_positions,
-        positions_mask=mask,
+        positions_mask=pos_mask,
         length_scale=length_scale,
         pair_mask=None,
         l1_clamp_distance=l1_clamp_distance,
@@ -350,49 +454,37 @@ def compute_fape_loss(output, tru_seq, pdb_path, length_scale=10.0, l1_clamp_dis
     
     return fape
 
-def compute_dist_loss(output, tru_seq, pdb_path):
-    # Extract predicted C1' positions
+
+def compute_dist_loss(output, pdb_data, device):
+    """Compute distance loss using preloaded PDB data"""
+    # Extract predicted distances
     pred_p_dist = output["p"][-1].squeeze(0)  # Shape [40, N, N]
     pred_c4_dist = output["c4_"][-1].squeeze(0)  # Shape [40, N, N]
     pred_n_dist = output["n"][-1].squeeze(0)  # Shape [40, N, N]
     pred_dist = torch.stack([pred_p_dist, pred_c4_dist, pred_n_dist], dim=0)
     
-    # Parse the PDB to get ground truth p, c4, n positions
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("gt", pdb_path)
-    chain = next(structure.get_chains())
-
-    pdb_seq = get_pdb_seq(structure)
-    mask = get_mask(tru_seq, pdb_seq)
+    # Get mask from preloaded data
+    mask = pdb_data['mask'].to(device)
+    
+    # Apply mask to predicted distances
     pred_dist = pred_dist[..., mask, :][..., :, mask]
     
-    # Extract p, c4, n atoms from the PDB structure
-    gt_p_positions = []
-    gt_c4_positions = []
-    gt_n_positions = []
-    for res in chain:
-        try:
-            gt_p_positions.append(res["p"].get_coord())
-            gt_c4_positions.append(res["c4_"].get_coord())
-            gt_n_positions.append(res["n"].get_coord())
-        except:
-            gt_p_positions.append(gt_p_positions[-1] if gt_p_positions else [0, 0, 0])
-            gt_c4_positions.append(gt_c4_positions[-1] if gt_c4_positions else [0, 0, 0])
-            gt_n_positions.append(gt_n_positions[-1] if gt_n_positions else [0, 0, 0])
-
-    positions = np.array([gt_p_positions, gt_c4_positions, gt_n_positions])
-
-    gt_positions = torch.tensor(positions, device=pred_p_dist.device, dtype=torch.float32) # shape [3, N, 3]
-    gt_dist = (gt_positions[..., None, :] - gt_positions[..., None, :, :]).norm(dim=-1) # shape [3, N, N]
-
-    boundaries = torch.linspace(2, 40, 39, device=pred_p_dist.device)
-
-    true_bins = torch.sum(gt_dist[..., None] > boundaries, dim=-1) # shape [3, N, N]
-
+    # Get ground truth positions from preloaded data
+    gt_dist_positions = pdb_data['dist_positions'].to(device).float()
+    gt_dist = torch.norm(gt_dist_positions.unsqueeze(-2) - gt_dist_positions.unsqueeze(-3), dim=-1)
+    
+    # Get distance bin boundaries
+    boundaries = torch.linspace(2, 40, 39, device=device)
+    
+    # Get bin indices for ground truth distances
+    true_bins = torch.sum(gt_dist.unsqueeze(-1) > boundaries, dim=-1)
+    
+    # Compute loss
     loss_fn = nn.CrossEntropyLoss(reduction='mean')
     loss = loss_fn(pred_dist, true_bins)
     
     return loss
+
 
 def load_checkpoint(model, checkpoint_path, rank):
     """
@@ -452,8 +544,6 @@ def evaluate_model(model, rank, world_size):
     logging.info(f"[Rank {rank}] Starting evaluation")
     model.eval()
     
-    # No barrier here - we'll handle synchronization in the calling function
-    
     def generator(features):
         # Use torch.no_grad() during evaluation
         with torch.no_grad():
@@ -493,7 +583,6 @@ def evaluate_model(model, rank, world_size):
         dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
         return 0.0
     finally:
-        # No barrier here - we'll handle synchronization in the calling function
         # Return to training mode
         model.train()
         # Free up memory
@@ -548,7 +637,6 @@ def train_worker(args):
         dist.broadcast(param.data, src=0)
     
     # Only use torch.compile if explicitly requested
-    # Skip compilation by default as it may not work well with this complex model
     if args.use_compile and hasattr(torch, 'compile'):
         try:
             logging.info("Attempting to compile model with torch.compile()...")
@@ -605,26 +693,26 @@ def train_worker(args):
     if args.checkpoint:
         start_epoch = load_checkpoint(model, args.checkpoint, rank)
     
-    # Create dataset and dataloader
-    dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2, max_seq_length=MAX_SEQ_LENGTH)
+    # Create dataset and dataloader with preloading enabled
+    dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2, max_seq_length=MAX_SEQ_LENGTH, preload_pdbs=True)
     
-    # Create distributed sampler - PyTorch's DistributedSampler automatically handles
-    # ensuring all GPUs get the same number of batches, avoiding deadlocks
+    # Create distributed sampler
     sampler = DistributedSampler(
         dataset, 
         num_replicas=world_size, 
         rank=rank,
         shuffle=False,
-        drop_last=True  # Drop the last batch to ensure all GPUs have same number of batches
+        drop_last=True
     )
     
-    # Create dataloader
+    # Create dataloader with pinned memory for faster CPU->GPU transfers
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
         sampler=sampler,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True  # Keep workers alive between epochs
     )
     
     # Training loop
@@ -676,7 +764,6 @@ def train_worker(args):
                     dist.barrier()
                 except Exception as e:
                     logging.error(f"[Rank {rank}] Evaluation block error: {str(e)}")
-                    # Try to synchronize processes even if evaluation fails
                     try:
                         dist.barrier()
                     except:
@@ -688,15 +775,15 @@ def train_worker(args):
                 # Free memory after evaluation
                 torch.cuda.empty_cache()
             
-            # Skip sequences that are too long to avoid OOM
-            seq = batch['seq'][0]
-            assert len(seq) <= MAX_SEQ_LENGTH, f"Sequence length {len(seq)} > {MAX_SEQ_LENGTH}"
-                
             # Process batch data
             seq_id = batch['seq_id'][0]
             tokens = batch['tokens'][0].to(device)
             rna_fm_tokens = batch['rna_fm_tokens'][0].to(device)
-            pdb_path = batch['pdb_path'][0]
+            seq = batch['seq'][0]
+            pdb_data = batch['pdb_data']
+            pdb_data = {key : item[0] for key, item in pdb_data.items()}
+            
+            # Add dimensions if needed
             while tokens.dim() < 3:
                 tokens = tokens.unsqueeze(0)
             while rna_fm_tokens.dim() < 2:
@@ -713,41 +800,27 @@ def train_worker(args):
             # Take the last output from recycles
             output = outputs[-1]
             
-            # Compute FAPE loss
-            fape_loss = compute_fape_loss(output, seq, pdb_path)
-            tm_score = compute_tm_loss(output, seq, pdb_path)
-            dist_loss = compute_dist_loss(output, seq, pdb_path)
+            # Convert mask to device and compute losses
+            fape_loss = compute_fape_loss(output, pdb_data, device)
+            tm_score_val = compute_tm_loss(output, pdb_data, device)
+            dist_loss = compute_dist_loss(output, pdb_data, device)
             
             # Combined loss: FAPE - 20 * TM score
-            loss = 2 * fape_loss - 200 * tm_score + 0.3 * dist_loss
+            loss = 2 * fape_loss - 100 * tm_score_val + 0.3 * dist_loss
             
             # Scale the loss for gradient accumulation
             loss = loss / GRAD_ACCUM_STEPS
             
-            # Backward pass
-            loss.backward()
+            accum = (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader)
+            if accum:
+                # Backward pass
+                loss.backward()
+            else:
+                with model.no_sync():
+                    loss.backward()
             
-            # Print parameters with no gradients (rank 0 only)
-            if False:
-                if rank == 0 and (batch_idx == 0 or batch_idx % 20 == 0):  # Only print occasionally to avoid spam
-                    params_with_no_grad = []
-                    params_with_grad = []
-                    for i, (name, param) in enumerate(model.named_parameters()):
-                        if param.grad is None:
-                            params_with_no_grad.append((i, name))
-                        else:
-                            params_with_grad.append((i, name))
-
-                    
-                    if params_with_no_grad:
-                        print(f"\n[Rank 0] Parameters with no gradients after backward pass (batch {batch_idx}):")
-                        for idx, name in params_with_no_grad:
-                            print(f"  [{idx}] {name}")
-                        print(f"Total: {len(params_with_no_grad)} parameters with no gradients")
-            
-            # Step if we've accumulated enough gradients
             nan_count = 0
-            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
+            if accum:
                 # Clip gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
@@ -761,7 +834,7 @@ def train_worker(args):
                 
                 optimizer.step()
                 optimizer.zero_grad()
-                if rank == 0:
+                if rank == 0 and args.use_wandb:
                     wandb.log({
                         "nan_count": nan_count
                     })
@@ -769,7 +842,7 @@ def train_worker(args):
             # Track loss
             epoch_loss += loss.item()
             epoch_fape_loss += fape_loss.item()
-            epoch_tm_score += tm_score
+            epoch_tm_score += tm_score_val
             epoch_dist_loss += dist_loss.item()
             processed_batches += 1
             
@@ -780,7 +853,7 @@ def train_worker(args):
                     "head_lr": optimizer.param_groups[0]['lr'],
                     "batch_loss": loss.item(),
                     "fape_loss": fape_loss.item(),
-                    "tm_score": tm_score,
+                    "tm_score": tm_score_val,
                     "dist_loss": dist_loss.item(),
                     "pLDDT": output["plddt"][1].item() if "plddt" in output else 0.0,
                     "seq_id": seq_id,
@@ -890,9 +963,6 @@ def train(args):
     
     For torchrun, this function directly calls train_worker
     instead of spawning processes, as torchrun handles process creation
-    
-    Args:
-        args: Command line arguments
     """
     try:
         # When using torchrun, we directly call train_worker 
