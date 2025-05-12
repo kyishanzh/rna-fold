@@ -31,10 +31,12 @@ from openfold.utils.rigid_utils import Rigid, Rotation
 from openfold.utils.loss import compute_fape
 
 # Import evaluation utilities
-from utils import eval_model, tm_score, all_seq_ids
+from utils import eval_model, tm_score, all_seq_ids, prepare_ds, split_to_csv, g_features
 
 # Import distributed utilities to ensure compatibility with eval_model
 from distributed_utils import get_world_size, get_rank, is_main_process
+
+torch.set_float32_matmul_precision('medium')
 
 # Training configuration
 CHECKPOINT_DIR = "checkpoints"
@@ -133,31 +135,57 @@ def extract_atom_positions_from_pdb(pdb_path, tru_seq):
         'pdb_seq': pdb_seq
     }
 
+class ValRNADataset(Dataset):
+    def __init__(self, data_dir, use_evo2=True, max_seq_length=MAX_SEQ_LENGTH):
+        self.data_dir = data_dir
+        self.use_evo2 = use_evo2
+        self.max_seq_length = max_seq_length
+        self.seq_ids = all_seq_ids(max_length=max_seq_length)
+        self.id_to_seq, self.id_to_loc = prepare_ds()
+
+    def __len__(self):
+        return len(self.seq_ids)
+    
+    def __getitem__(self, idx):
+        seq_id = self.seq_ids[idx]
+        # Use g_features to load the actual data for the sequence
+        features = g_features(seq_id)
+        loc = self.id_to_loc[seq_id]
+        features["loc"] = loc
+        return features
+
 class RNADataset(Dataset):
-    def __init__(self, data_dir, use_evo2=True, max_seq_length=MAX_SEQ_LENGTH, preload_pdbs=True):
+    def __init__(self, data_dir, use_evo2=True, max_seq_length=MAX_SEQ_LENGTH, preload_pdbs=True, seq_ids=None, split='train'):
         self.data_dir = data_dir
         self.use_evo2 = use_evo2
         self.max_seq_length = max_seq_length
         self.preload_pdbs = preload_pdbs
+        self.split = split
         
         # For caching loaded data
         self.cached_features = {}
         self.cached_evo2_embeddings = {}
         self.cached_pdb_data = {}
 
-        if not USE_RHOFOLD_DATA:
-            self.seq_ids = all_seq_ids()
-            return
-        
-        # Get sequence IDs from the directory
-        seq_dir = os.path.join(data_dir, "RNA3D_DATA/seq")
-        
-        # Filter sequence IDs to only include those with both seq and a3m files
-        self.seq_ids = []
-        for f in os.listdir(seq_dir):
-            if f.endswith('.seq'):
-                seq_id = f.split('.')[0]
-                self.seq_ids.append(seq_id)
+        # Use provided seq_ids if given, otherwise get from the directory
+        if seq_ids:
+            self.seq_ids = seq_ids
+            if is_main_process():
+                print(f"Using {len(self.seq_ids)} provided sequence IDs for {split} dataset")
+        else:
+            if not USE_RHOFOLD_DATA:
+                self.seq_ids = all_seq_ids(split)
+                return
+            
+            # Get sequence IDs from the directory
+            seq_dir = os.path.join(data_dir, "RNA3D_DATA/seq")
+            
+            # Filter sequence IDs to only include those with both seq and a3m files
+            self.seq_ids = []
+            for f in os.listdir(seq_dir):
+                if f.endswith('.seq'):
+                    seq_id = f.split('.')[0]
+                    self.seq_ids.append(seq_id)
         
         # Track filtered out sequences
         self.filtered_ids = []
@@ -169,8 +197,12 @@ class RNADataset(Dataset):
         for seq_id in self.seq_ids:
             if seq_id == '4v9r_BB':
                 continue
-            pdb_path = os.path.join(data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
-            input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
+            if seq_ids:
+                pdb_path = os.path.join(data_dir, f"MSA")
+                input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
+            else:
+                pdb_path = os.path.join(data_dir, f"RNA3D_DATA/pdb/{seq_id}.pdb")
+                input_fas = os.path.join(data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
             # Read sequence to check length
             seq = read_fas(input_fas)[0][1]
             if not os.path.exists(pdb_path):
@@ -197,25 +229,30 @@ class RNADataset(Dataset):
                     self.skipped_long_seqs.append(seq_id)
             else:
                 filtered_seq_ids.append(seq_id)
-            if len(filtered_seq_ids) >= 100: break
         
         self.seq_ids = filtered_seq_ids
         
-        logging.info(f"Found {len(self.seq_ids)} RNA sequences with valid PDB files for training")
-        if self.missing_pdb_ids:
-            logging.info(f"Filtered out {len(self.missing_pdb_ids)} sequences with missing PDB files")
-        if self.skipped_long_seqs:
-            logging.info(f"Skipped {len(self.skipped_long_seqs)} sequences with length > {MAX_SEQ_LENGTH}")
+        if is_main_process():
+            logging.info(f"Found {len(self.seq_ids)} RNA sequences with valid PDB files for {split}")
+            if self.missing_pdb_ids:
+                logging.info(f"Filtered out {len(self.missing_pdb_ids)} sequences with missing PDB files")
+            if self.skipped_long_seqs:
+                logging.info(f"Skipped {len(self.skipped_long_seqs)} sequences with length > {MAX_SEQ_LENGTH}")
             
         # Preload data if enabled
         if self.preload_pdbs:
             self._preload_data()
+        
+        # Filter seq_ids based on the split
+        if seq_ids:
+            self.seq_ids = [seq_id for seq_id in self.seq_ids if seq_id in seq_ids]
     
     def _preload_data(self):
         """Preload all sequence data, evo2 embeddings, and PDB data to avoid disk I/O during training"""
-        logging.info(f"Preloading data for {len(self.seq_ids)} sequences...")
+        if is_main_process():
+            logging.info(f"Preloading data for {len(self.seq_ids)} sequences for {self.split} dataset...")
         
-        for idx, seq_id in enumerate(tqdm(self.seq_ids, desc="Preloading data")):
+        for idx, seq_id in enumerate(tqdm(self.seq_ids, desc=f"Preloading {self.split} data", disable=not is_main_process())):
             # Load sequence and MSA features
             if USE_RHOFOLD_DATA:
                 input_fas = os.path.join(self.data_dir, f"RNA3D_DATA/seq/{seq_id}.seq")
@@ -260,7 +297,10 @@ class RNADataset(Dataset):
             }
             self.cached_pdb_data[seq_id] = pdb_data
             
-        logging.info(f"Preloaded data for {len(self.cached_features)} sequences")
+        if is_main_process():
+            logging.info(f"Preloaded data for {len(self.cached_features)} sequences for {self.split} dataset")
+            logging.info(f"Filtered out {len(self.filtered_ids)} sequences for {self.split} dataset")
+            logging.info(f"Missing PDB data for {len(self.missing_pdb_ids)} sequences for {self.split} dataset")
     
     def __len__(self):
         return len(self.seq_ids)
@@ -450,20 +490,37 @@ class RNADataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         
     def setup(self, stage=None):
-        # Create full dataset - we'll use the same for train and validation
-        self.dataset = RNADataset(
+        # Create training dataset using IDs from utils.py
+        self.train_dataset = RNADataset(
             self.data_dir, 
             use_evo2=self.use_evo2, 
             max_seq_length=self.max_seq_length, 
-            preload_pdbs=self.preload_pdbs
+            preload_pdbs=self.preload_pdbs,
+            split='train'
+        )
+        
+        # Create validation dataset using IDs from utils.py
+        self.val_dataset = ValRNADataset(
+            self.data_dir, 
+            use_evo2=self.use_evo2, 
+            max_seq_length=self.max_seq_length, 
         )
         
         # Print dataset stats
-        print(f"Dataset loaded with {len(self.dataset)} sequences")
+        print(f"Train dataset loaded with {len(self.train_dataset)} sequences")
+        print(f"Validation dataset loaded with {len(self.val_dataset)} sequences")
+        
+        # Log filtered sequences
+        if hasattr(self.train_dataset, 'filtered_ids'):
+            print(f"Filtered out {len(self.train_dataset.filtered_ids)} training sequences due to dimension mismatch")
+        if hasattr(self.train_dataset, 'missing_pdb_ids'):
+            print(f"Filtered out {len(self.train_dataset.missing_pdb_ids)} training sequences with missing or invalid PDB files")
+        if hasattr(self.train_dataset, 'skipped_long_seqs'):
+            print(f"Skipped {len(self.train_dataset.skipped_long_seqs)} long training sequences (> {self.max_seq_length})")
         
     def train_dataloader(self):
         return DataLoader(
-            self.dataset,
+            self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
@@ -472,10 +529,8 @@ class RNADataModule(pl.LightningDataModule):
         )
     
     def val_dataloader(self):
-        # Use the same dataset for validation - in practice we'll use the EvaluationCallback
-        # for more thorough evaluation
         return DataLoader(
-            self.dataset,
+            self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
@@ -486,12 +541,18 @@ class RNADataModule(pl.LightningDataModule):
     def get_dataset_info(self):
         """Return information about filtered sequences, etc."""
         info = {}
-        if hasattr(self.dataset, 'filtered_ids'):
-            info['filtered_ids'] = self.dataset.filtered_ids
-        if hasattr(self.dataset, 'missing_pdb_ids'):
-            info['missing_pdb_ids'] = self.dataset.missing_pdb_ids
-        if hasattr(self.dataset, 'skipped_long_seqs'):
-            info['skipped_long_seqs'] = self.dataset.skipped_long_seqs
+        if hasattr(self.train_dataset, 'filtered_ids'):
+            info['train_filtered_ids'] = self.train_dataset.filtered_ids
+        if hasattr(self.train_dataset, 'missing_pdb_ids'):
+            info['train_missing_pdb_ids'] = self.train_dataset.missing_pdb_ids
+        if hasattr(self.train_dataset, 'skipped_long_seqs'):
+            info['train_skipped_long_seqs'] = self.train_dataset.skipped_long_seqs
+        if hasattr(self.val_dataset, 'filtered_ids'):
+            info['val_filtered_ids'] = self.val_dataset.filtered_ids
+        if hasattr(self.val_dataset, 'missing_pdb_ids'):
+            info['val_missing_pdb_ids'] = self.val_dataset.missing_pdb_ids
+        if hasattr(self.val_dataset, 'skipped_long_seqs'):
+            info['val_skipped_long_seqs'] = self.val_dataset.skipped_long_seqs
         return info
 
 # PyTorch Lightning Module for RhoFold training
@@ -500,7 +561,6 @@ class RhoFoldLightningModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(config)
         self.model = RhoFold(rhofold_config)
-        self.automatic_optimization = False  # Handle optimization manually for more control
         
         # Set dropout rate
         for module in self.model.modules():
@@ -514,9 +574,6 @@ class RhoFoldLightningModule(pl.LightningModule):
         return self.model(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=train)
     
     def training_step(self, batch, batch_idx):
-        # Get optimizer
-        opt = self.optimizers()
-        
         # Extract batch data
         seq_id = batch['seq_id'][0]
         tokens = batch['tokens'][0]
@@ -536,59 +593,22 @@ class RhoFoldLightningModule(pl.LightningModule):
         if self.hparams["use_evo2"] and 'evo2_fea' in batch and batch['evo2_fea'] is not None:
             evo2_fea = batch['evo2_fea'][0].to(torch.float32)
         
-        # Zero gradients
-        opt.zero_grad()
-        
         # Run model forward pass
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.trainer.precision == "bf16-mixed"):
-            outputs = self(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
-            
-            # Take the last output from recycles
-            output = outputs[-1]
-            
-            # Compute losses
-            fape_loss = compute_fape_loss(output, pdb_data, self.device)
-            tm_score_val = compute_tm_loss(output, pdb_data, self.device)
-            dist_loss = compute_dist_loss(output, pdb_data, self.device)
-            
-            # Combined loss: FAPE - 100 * TM score + 0.3 * dist_loss
-            loss = 2 * fape_loss - 100 * tm_score_val + 0.3 * dist_loss
-            
-            # Scale the loss for gradient accumulation
-            loss = loss / self.hparams["grad_accum_steps"]
+        outputs = self(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
         
-        # Backward pass
-        self.manual_backward(loss)
+        # Take the last output from recycles
+        output = outputs[-1]
         
-        # Update weights if we've accumulated enough gradients
-        if (batch_idx + 1) % self.hparams["grad_accum_steps"] == 0:
-            # Clip gradients
-            self.clip_gradients(opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
-            
-            # Check for NaN gradients and replace with zeros
-            nan_count = 0
-            for param in self.parameters():
-                if param.grad is not None:
-                    nan_mask = torch.isnan(param.grad)
-                    if nan_mask.any():
-                        nan_count += nan_mask.sum().item()
-                        param.grad[nan_mask] = 0.0
-            
-            # Step the optimizer
-            opt.step()
-            opt.zero_grad()
-            
-            # Step the learning rate schedulers
-            schedulers = self.lr_schedulers()
-            
-            # Step the warmup scheduler every step
-            if isinstance(schedulers, list) and len(schedulers) > 0:
-                # First scheduler is the warmup scheduler (step-based)
-                if self.global_step < self.hparams["warmup_steps"]:
-                    schedulers[0].step()
+        # Compute losses
+        fape_loss = compute_fape_loss(output, pdb_data, self.device)
+        tm_score_val = compute_tm_loss(output, pdb_data, self.device)
+        dist_loss = compute_dist_loss(output, pdb_data, self.device)
+        
+        # Combined loss: FAPE - 100 * TM score + 0.3 * dist_loss
+        loss = 2 * fape_loss - 100 * tm_score_val + 0.3 * dist_loss
         
         # Log metrics
-        self.log("train_loss", loss * self.hparams["grad_accum_steps"], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("train_fape_loss", fape_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train_tm_score", tm_score_val, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train_dist_loss", dist_loss, on_step=True, on_epoch=True, sync_dist=True)
@@ -597,29 +617,24 @@ class RhoFoldLightningModule(pl.LightningModule):
             self.log("pLDDT", output["plddt"][1].item(), on_step=True, sync_dist=True)
         
         self.log("seq_length", len(seq), on_step=True, sync_dist=True)
-        self.log("nan_count", float(nan_count), on_step=True, on_epoch=True, sync_dist=True)
         
         # Log evo2head norm
         evo2head_norm = get_evo2head_norm(self)
         self.log("evo2head_norm", evo2head_norm, on_step=True, on_epoch=True, sync_dist=True)
         
         # Log learning rates
-        self.log("lr_evo2", opt.param_groups[0]['lr'], on_step=True, sync_dist=True)
-        self.log("lr_main", opt.param_groups[1]['lr'], on_step=True, sync_dist=True)
+        self.log("lr_evo2", self.optimizers().param_groups[0]['lr'], on_step=True, sync_dist=True)
+        self.log("lr_main", self.optimizers().param_groups[1]['lr'], on_step=True, sync_dist=True)
         
-        return {"loss": loss * self.hparams["grad_accum_steps"]}
+        return loss
     
     def validation_step(self, batch, batch_idx):
-        # For proper validation, this should coordinate with the other processes
-        # But since the EvaluationCallback will use the original eval_model function,
-        # we can make this lightweight
         # Extract batch data for validation
         seq_id = batch['seq_id'][0]
         tokens = batch['tokens'][0]
         rna_fm_tokens = batch['rna_fm_tokens'][0]
         seq = batch['seq'][0]
-        pdb_data = batch['pdb_data']
-        pdb_data = {key: val[0] for key, val in pdb_data.items()}
+        loc = batch['loc'][0]
         
         # Add dimensions if needed
         while tokens.dim() < 3:
@@ -640,17 +655,20 @@ class RhoFoldLightningModule(pl.LightningModule):
             output = outputs[-1]
             
             # Compute validation metrics
-            fape_loss = compute_fape_loss(output, pdb_data, self.device)
-            tm_score_val = compute_tm_loss(output, pdb_data, self.device)
-            dist_loss = compute_dist_loss(output, pdb_data, self.device)
+            loc = loc.to(self.device)
+            pred_c1_positions = output["cords_c1'"][-1].squeeze(0)
+            tm_score_val = tm_score(pred_c1_positions, loc)
             
             # Log validation metrics
-            self.log("val_fape_loss", fape_loss, sync_dist=True)
             self.log("val_tm_score", tm_score_val, sync_dist=True)
-            self.log("val_dist_loss", dist_loss, sync_dist=True)
             
             # Store TM score for on_validation_epoch_end
             self.validation_tm_scores.append(tm_score_val)
+            
+            return {
+                "val_tm_score": tm_score_val,
+                "seq_id": seq_id
+            }
     
     def on_validation_epoch_end(self):
         # Skip if no validation was performed
@@ -771,7 +789,8 @@ class EvaluationCallback(pl.Callback):
             
             # Only log metrics on the main process as eval_model already handles aggregation
             if trainer.is_global_zero:
-                trainer.logger.log_metrics({"eval_tm_score": eval_score})
+                if trainer.logger:  # Check if logger exists before logging metrics
+                    trainer.logger.log_metrics({"eval_tm_score": eval_score})
                 print(f"[Evaluation] TM Score: {eval_score:.4f}")
             
         except Exception as e:
@@ -821,17 +840,14 @@ def train(args):
         except Exception as e:
             print(f"Model compilation failed, using eager mode: {str(e)}")
     
-    # Create dataset
-    dataset = RNADataset(args.data_dir, use_evo2=USE_EVO2, max_seq_length=MAX_SEQ_LENGTH, preload_pdbs=True)
-    
-    # Configure data loaders
-    train_loader = DataLoader(
-        dataset,
+    # Create data module instead of direct dataloaders
+    data_module = RNADataModule(
+        args.data_dir,
         batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True
+        use_evo2=USE_EVO2,
+        max_seq_length=MAX_SEQ_LENGTH,
+        preload_pdbs=True,
+        num_workers=4
     )
     
     # Configure loggers
@@ -856,11 +872,13 @@ def train(args):
             save_last=True,
             every_n_epochs=CHECKPOINT_EVERY
         ),
-        # Learning rate monitor
-        LearningRateMonitor(logging_interval='step'),
         # Custom evaluation callback
         EvaluationCallback(eval_per_epoch=EVAL_PER_EPOCH)
     ]
+    
+    # Add LearningRateMonitor only when a logger is available
+    if args.use_wandb:
+        callbacks.append(LearningRateMonitor(logging_interval='step'))
     
     # Configure DDP strategy
     strategy = DDPStrategy(
@@ -869,7 +887,7 @@ def train(args):
     )
     
     # Configure precision based on hardware support
-    precision = "bf16-mixed" if bf16_supported else "32"
+    precision = '32'
     
     # Create Lightning trainer
     trainer = pl.Trainer(
@@ -881,6 +899,8 @@ def train(args):
         precision=precision,  # Use bf16 mixed precision when supported
         log_every_n_steps=10,
         default_root_dir=CHECKPOINT_DIR,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
     )
     
     # Load checkpoint if provided
@@ -906,16 +926,8 @@ def train(args):
         model.model.load_state_dict(state_dict, strict=False)
         print("Checkpoint loaded successfully.")
     
-    # Log dataset info if available
-    if hasattr(dataset, 'filtered_ids'):
-        print(f"Filtered out {len(dataset.filtered_ids)} sequences due to dimension mismatch")
-    if hasattr(dataset, 'missing_pdb_ids'):
-        print(f"Filtered out {len(dataset.missing_pdb_ids)} sequences with missing or invalid PDB files")
-    if hasattr(dataset, 'skipped_long_seqs'):
-        print(f"Skipped {len(dataset.skipped_long_seqs)} long sequences (> {MAX_SEQ_LENGTH})")
-    
-    # Train the model
-    trainer.fit(model, train_loader)
+    # Train the model with data_module
+    trainer.fit(model, data_module)
     
     # Load and evaluate the best model
     best_checkpoint_path = trainer.checkpoint_callback.best_model_path

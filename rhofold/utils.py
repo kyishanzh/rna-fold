@@ -98,11 +98,11 @@ def split_to_csv(split="train"):  # train, val, test
     return csv_path
 
 
-def all_seq_ids(split="train"):  # train, val, test; return all the seq ids
+def all_seq_ids(split="train", max_length=200):  # train, val, test; return all the seq ids
     csv_path = split_to_csv(split)
     df = pd.read_csv(csv_path)
     idx_list = df["target_id"].tolist()
-    return [idx for idx in idx_list if len(id_to_seq[idx]) < 200]
+    return [idx for idx in idx_list if len(id_to_seq[idx]) < max_length]
 
 
 def g_features(seq_id):
@@ -120,9 +120,9 @@ def g_features(seq_id):
     return {
         "seq": features["seq"],
         "seq_id": seq_id,
-        "tokens": features["tokens"].cuda(),
-        "rna_fm_tokens": features["rna_fm_tokens"].cuda(),
-        "evo2_fea": torch.tensor(evo2_fea).cuda(),
+        "tokens": features["tokens"],
+        "rna_fm_tokens": features["rna_fm_tokens"],
+        "evo2_fea": torch.tensor(evo2_fea),
     }
 
 
@@ -180,19 +180,29 @@ def tm_score(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     assert X.shape == Y.shape and X.dim() == 2 and X.size(1) == 3, "need [L,3] vs [L,3]"
     L = X.size(0)
 
+    X_fp32 = X.to(torch.float32)
+    Y_fp32 = Y.to(torch.float32)
+    
+    # Store original dtype for returning result in same dtype
+    original_dtype = X.dtype
+
     # 1. shift to center of mass
-    Xc = X - X.mean(0, keepdim=True)
-    Yc = Y - Y.mean(0, keepdim=True)
+    Xc = X_fp32 - X_fp32.mean(0, keepdim=True)
+    Yc = Y_fp32 - Y_fp32.mean(0, keepdim=True)
 
     # 2. kabsch – covariance & SVD
     C = Xc.t() @ Yc
+    
+    # Perform SVD in fp32
     V, S, Wt = torch.linalg.svd(C)
+    
     # handle possible improper rotation
     d = torch.det(V @ Wt)
-    D = torch.diag(torch.tensor([1, 1, torch.sign(d)], device=V.device))
+    D = torch.diag(torch.tensor([1, 1, torch.sign(d)], device=V.device, dtype=V.dtype))
     R = V @ D @ Wt
 
-    # 3. rotate Xc
+    # 3. rotate Xc - convert rotation matrix back to original dtype
+    R = R.to(Xc.dtype)
     X_aligned = Xc @ R
 
     # 4. distances
@@ -212,7 +222,9 @@ def tm_score(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         d0 = 0.6 * (L - 0.5) ** 0.5 - 2.5
 
     tm = torch.mean(1.0 / (1.0 + (dists / d0) ** 2))
-    return tm
+    
+    # Return result in original dtype to maintain gradient flow
+    return tm.to(original_dtype) if tm.dtype != original_dtype else tm
 
 
 import torch.distributed as dist
