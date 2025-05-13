@@ -43,9 +43,9 @@ CHECKPOINT_DIR = "checkpoints"
 USE_EVO2 = True
 BATCH_SIZE = 1  # Keep batch size at 1 for each GPU
 NUM_EPOCHS = 20
-LEARNING_RATE = 2e-7
-EVO2_LR = 1e-4  # Higher learning rate for evo2_head
-EVAL_PER_EPOCH = 10  # Number of evaluations per epoch
+LEARNING_RATE = 4e-7
+EVO2_LR = 3e-4  # Higher learning rate for evo2_head
+EVAL_PER_EPOCH = 4  # Number of evaluations per epoch
 CHECKPOINT_EVERY = 1
 WARMUP_STEPS = 1000
 SKIP_SHORT_SEQS = True  # Skip sequences with length > MAX_SEQ_LENGTH
@@ -591,7 +591,7 @@ class RhoFoldLightningModule(pl.LightningModule):
         # Handle evo2 features
         evo2_fea = None
         if self.hparams["use_evo2"] and 'evo2_fea' in batch and batch['evo2_fea'] is not None:
-            evo2_fea = batch['evo2_fea'][0].to(torch.float32)
+            evo2_fea = batch['evo2_fea'][0]
         
         # Run model forward pass
         outputs = self(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
@@ -612,6 +612,7 @@ class RhoFoldLightningModule(pl.LightningModule):
         self.log("train_fape_loss", fape_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train_tm_score", tm_score_val, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train_dist_loss", dist_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("batch_size", 1, on_step=True, on_epoch=True)
         
         if "plddt" in output:
             self.log("pLDDT", output["plddt"][1].item(), on_step=True, sync_dist=True)
@@ -645,7 +646,7 @@ class RhoFoldLightningModule(pl.LightningModule):
         # Handle evo2 features
         evo2_fea = None
         if self.hparams["use_evo2"] and 'evo2_fea' in batch and batch['evo2_fea'] is not None:
-            evo2_fea = batch['evo2_fea'][0].to(torch.float32)
+            evo2_fea = batch['evo2_fea'][0]
         
         with torch.no_grad():
             # Run model forward pass
@@ -731,6 +732,17 @@ class RhoFoldLightningModule(pl.LightningModule):
         }
         
         return [optimizer], [warmup_scheduler, cosine_scheduler]
+        
+    def on_before_optimizer_step(self, optimizer):
+        # Check and fix NaN gradients before optimizer step
+        nan_param_count = 0
+        for param_group in optimizer.param_groups:
+            for param in param_group['params']:
+                if param.grad is not None:
+                    # Replace NaN gradients with zeros
+                    torch.nan_to_num_(param.grad, nan=0.0, posinf=1.0, neginf=-1.0)
+                    nan_param_count += param.numel()
+        self.log("nan_param_count", nan_param_count, on_step=True, on_epoch=True, sync_dist=True)
 
 # Custom callback for evaluation during training
 class EvaluationCallback(pl.Callback):
@@ -758,14 +770,12 @@ class EvaluationCallback(pl.Callback):
                 torch.cuda.empty_cache()
     
     def _run_evaluation(self, trainer, pl_module):
-        print(f"\n[Evaluation] Running during training...")
-        
         # Create a generator function for eval_model that matches the expected interface
         def generator(features):
             with torch.no_grad():
                 try:
                     if "evo2_fea" in features:
-                        features["evo2_fea"] = features["evo2_fea"].to(torch.float32)
+                        features["evo2_fea"] = features["evo2_fea"]
                     
                     outputs = pl_module(
                         tokens=features["tokens"].to(pl_module.device),
@@ -776,7 +786,7 @@ class EvaluationCallback(pl.Callback):
                     
                     preds = []
                     for i in range(min(5, len(outputs))):
-                        preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
+                        preds.append(outputs[i]["cords_c1'"][0][0])
                     return preds
                 except Exception as e:
                     print(f"Error in generator: {str(e)}")
@@ -887,7 +897,7 @@ def train(args):
     )
     
     # Configure precision based on hardware support
-    precision = '32'
+    precision = 'bf16-mixed'
     
     # Create Lightning trainer
     trainer = pl.Trainer(

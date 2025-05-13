@@ -134,7 +134,12 @@ def kabsch_align(P, Q):
     Q_centered = Q - Q_mean
 
     H = P_centered.T @ Q_centered
-    U, S, Vt = torch.svd(H)
+    with torch.autocast(device_type="cuda", enabled=False):
+        H_fp32 = H.to(torch.float32)
+        U_fp32, S_fp32, Vt_fp32 = torch.svd(H_fp32)
+        U = U_fp32.to(H.dtype)
+        Vt = Vt_fp32.to(H.dtype)
+        S = S_fp32.to(H.dtype)
     R = Vt @ U.T
     if torch.det(R) < 0:
         Vt[-1, :] *= -1
@@ -180,26 +185,22 @@ def tm_score(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     assert X.shape == Y.shape and X.dim() == 2 and X.size(1) == 3, "need [L,3] vs [L,3]"
     L = X.size(0)
 
-    X_fp32 = X.to(torch.float32)
-    Y_fp32 = Y.to(torch.float32)
-    
-    # Store original dtype for returning result in same dtype
-    original_dtype = X.dtype
-
     # 1. shift to center of mass
-    Xc = X_fp32 - X_fp32.mean(0, keepdim=True)
-    Yc = Y_fp32 - Y_fp32.mean(0, keepdim=True)
+    Xc = X - X.mean(0, keepdim=True)
+    Yc = Y - Y.mean(0, keepdim=True)
 
     # 2. kabsch – covariance & SVD
     C = Xc.t() @ Yc
     
     # Perform SVD in fp32
-    V, S, Wt = torch.linalg.svd(C)
+    with torch.autocast(device_type="cuda", enabled=False):
+        C_fp32 = C.to(torch.float32)
+        V_fp32, S_fp32, Wt_fp32 = torch.linalg.svd(C_fp32)
     
-    # handle possible improper rotation
-    d = torch.det(V @ Wt)
-    D = torch.diag(torch.tensor([1, 1, torch.sign(d)], device=V.device, dtype=V.dtype))
-    R = V @ D @ Wt
+        # handle possible improper rotation
+        d = torch.det(V_fp32 @ Wt_fp32)
+        D = torch.diag(torch.tensor([1, 1, torch.sign(d)], device=V_fp32.device, dtype=V_fp32.dtype))
+        R = V_fp32 @ D @ Wt_fp32
 
     # 3. rotate Xc - convert rotation matrix back to original dtype
     R = R.to(Xc.dtype)
@@ -222,9 +223,7 @@ def tm_score(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         d0 = 0.6 * (L - 0.5) ** 0.5 - 2.5
 
     tm = torch.mean(1.0 / (1.0 + (dists / d0) ** 2))
-    
-    # Return result in original dtype to maintain gradient flow
-    return tm.to(original_dtype) if tm.dtype != original_dtype else tm
+    return tm
 
 
 import torch.distributed as dist
