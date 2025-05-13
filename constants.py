@@ -1,1 +1,2 @@
-NVIDIA_API = "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"
+# NVIDIA_API = "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"
+NVIDIA_API = "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"
