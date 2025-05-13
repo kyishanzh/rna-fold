@@ -522,7 +522,7 @@ class RNADataModule(pl.LightningDataModule):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=True
@@ -591,7 +591,7 @@ class RhoFoldLightningModule(pl.LightningModule):
         # Handle evo2 features
         evo2_fea = None
         if self.hparams["use_evo2"] and 'evo2_fea' in batch and batch['evo2_fea'] is not None:
-            evo2_fea = batch['evo2_fea'][0]
+            evo2_fea = batch['evo2_fea'][0].to(torch.float32)
         
         # Run model forward pass
         outputs = self(tokens=tokens, rna_fm_tokens=rna_fm_tokens, seq=seq, evo2_fea=evo2_fea, train=True)
@@ -646,7 +646,7 @@ class RhoFoldLightningModule(pl.LightningModule):
         # Handle evo2 features
         evo2_fea = None
         if self.hparams["use_evo2"] and 'evo2_fea' in batch and batch['evo2_fea'] is not None:
-            evo2_fea = batch['evo2_fea'][0]
+            evo2_fea = batch['evo2_fea'][0].to(torch.float32)
         
         with torch.no_grad():
             # Run model forward pass
@@ -775,7 +775,7 @@ class EvaluationCallback(pl.Callback):
             with torch.no_grad():
                 try:
                     if "evo2_fea" in features:
-                        features["evo2_fea"] = features["evo2_fea"]
+                        features["evo2_fea"] = features["evo2_fea"].to(torch.float32)
                     
                     outputs = pl_module(
                         tokens=features["tokens"].to(pl_module.device),
@@ -786,7 +786,7 @@ class EvaluationCallback(pl.Callback):
                     
                     preds = []
                     for i in range(min(5, len(outputs))):
-                        preds.append(outputs[i]["cords_c1'"][0][0])
+                        preds.append(outputs[i]["cords_c1'"][0][0].to(torch.float32))
                     return preds
                 except Exception as e:
                     print(f"Error in generator: {str(e)}")
