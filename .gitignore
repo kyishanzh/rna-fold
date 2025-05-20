@@ -5,3 +5,6 @@ __pycache__
 *.csv
 *.pt
 *.zip
+**.log
+**wandb
+**checkpoints

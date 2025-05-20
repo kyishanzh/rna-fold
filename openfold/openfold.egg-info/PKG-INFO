@@ -1,0 +1,12 @@
+Metadata-Version: 2.1
+Name: openfold
+Version: 2.2.0
+Summary: A PyTorch reimplementation of DeepMind's AlphaFold 2
+Home-page: https://github.com/aqlaboratory/openfold
+Author: OpenFold Team
+Author-email: jennifer.wei@omsf.io
+License: Apache License, Version 2.0
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Programming Language :: Python :: 3.10,Topic :: Scientific/Engineering :: Artificial Intelligence
+License-File: LICENSE
